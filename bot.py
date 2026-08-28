@@ -199,6 +199,11 @@ def get_worksheet():
             title=WORKSHEET_NAME, rows=1000, cols=len(HEADERS)
         )
 
+    # лист от старой версии бота бывает шириной ровно в 8 колонок —
+    # тогда запись в I1 падает с «exceeds grid limits», сначала расширяем лист
+    if ws.col_count < len(HEADERS):
+        ws.add_cols(len(HEADERS) - ws.col_count)
+
     first_row = ws.row_values(1)
     if not first_row:
         ws.append_row(HEADERS, value_input_option="USER_ENTERED")
