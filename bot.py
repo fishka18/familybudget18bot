@@ -141,8 +141,8 @@ ALIASES = {
 # --- структура листа «Операции» в бюджетной таблице ---
 # A Дата · B Категория · C Тип · D Группа · E Статус · F Счёт · G Сумма
 # H Комментарий · I Месяц · J День нед. · K Год · L Месяц (выбор) · M День (выбор)
-# Часть колонок — формулы. Бот их не заполняет: он копирует строку-образец,
-# и формулы приходят вместе с ней, пересчитавшись на новую строку.
+# Часть колонок — формулы. Бот их не заполняет: он занимает уже готовую строку
+# журнала (или копирует образец), и формулы считают сами.
 BUDGET_COLS = 13
 HEADER_ROW = int(env("HEADER_ROW", "2"))      # строка с заголовками
 FIRST_DATA_ROW = HEADER_ROW + 1
@@ -152,10 +152,6 @@ COL_STATUS, COL_ACCOUNT, COL_AMOUNT, COL_COMMENT = 5, 6, 7, 8
 COL_MONTH, COL_WEEKDAY, COL_YEAR, COL_MONTH_PICK, COL_DAY_PICK = 9, 10, 11, 12, 13
 
 STATUS_FACT, STATUS_PLAN = "Факт", "План"
-
-# сортировать журнал по дате после каждой записи, чтобы новые факты
-# вставали между плановыми строками, а не копились внизу
-SORT_AFTER_ADD = env("SORT_AFTER_ADD", "да").lower() not in ("нет", "no", "false", "0")
 
 # скрытый лист в той же таблице: кто и когда что внёс через бота.
 # В самом журнале операций автора нет, а для «Мои итоги» и /undo он нужен.
@@ -321,20 +317,6 @@ def find_target_row(values):
     return last_filled + 1, False
 
 
-def sort_by_date(ws, last_row):
-    """Сортирует журнал по дате, чтобы новые факты встали на своё место."""
-    if last_row <= FIRST_DATA_ROW:
-        return
-    ws.spreadsheet.batch_update({"requests": [{"sortRange": {
-        "range": {
-            "sheetId": ws.id,
-            "startRowIndex": FIRST_DATA_ROW - 1, "endRowIndex": last_row,
-            "startColumnIndex": 0, "endColumnIndex": BUDGET_COLS,
-        },
-        "sortSpecs": [{"dimensionIndex": 0, "sortOrder": "ASCENDING"}],
-    }}]})
-
-
 def add_row(kind, amount, category, comment, user, when, account):
     """
     Записывает операцию в журнал бюджета со статусом «Факт».
@@ -401,9 +383,6 @@ def add_row(kind, amount, category, comment, user, when, account):
         updates.append({"range": rowcol_to_a1(new_row, col), "values": [[value]]})
     if updates:
         ws.batch_update(updates, value_input_option="USER_ENTERED")
-
-    if SORT_AFTER_ADD:
-        sort_by_date(ws, new_row)
 
     write_log(user, kind, amount, category, account, comment, when)
 
@@ -472,8 +451,8 @@ def read_my_rows(user_id):
 def delete_last_row_of(user_id):
     """
     Убирает последнюю запись этого человека и возвращает текст для ответа.
-    Строку в «Операциях» ищем по значениям, а не по номеру: журнал сортируется,
-    и номера строк со временем разъезжаются.
+    Строку в «Операциях» ищем по значениям, а не по номеру: строки могли
+    сдвинуться, если журнал правили вручную.
     """
     log_ws = get_log_sheet()
     log_values = log_ws.get_all_values()
