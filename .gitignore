@@ -1,0 +1,11 @@
+# Секреты — НИКОГДА не попадают в репозиторий
+credentials.json
+.env
+*.json.key
+service-account*.json
+
+# Служебное
+__pycache__/
+*.pyc
+.venv/
+venv/

@@ -1,0 +1,7 @@
+pyTelegramBotAPI
+gspread
+google-auth
+python-dotenv
+tzdata
+flask
+gunicorn
