@@ -296,6 +296,31 @@ def find_template_row(values):
     return None
 
 
+def find_target_row(values):
+    """
+    Куда писать новую операцию.
+    Ниже данных в журнале лежат заранее оформленные пустые строки — со статусом
+    «План», счётом и выпадающими списками. Занимаем первую такую: в ней уже есть
+    и формулы, и форматирование. Если запаса нет — пишем следом за последней
+    заполненной строкой.
+    Возвращает (строка для записи, есть ли она уже в листе).
+    """
+    last_filled = HEADER_ROW
+    first_free = None
+    for index in range(FIRST_DATA_ROW - 1, len(values)):
+        row = list(values[index]) + [""] * BUDGET_COLS
+        busy = bool(row[COL_CATEGORY - 1].strip()) or parse_money(row[COL_AMOUNT - 1]) is not None
+        if busy:
+            last_filled = index + 1
+            first_free = None  # ниже ещё есть данные — эта пустая строка не в счёт
+        elif first_free is None:
+            first_free = index + 1
+
+    if first_free:
+        return first_free, True
+    return last_filled + 1, False
+
+
 def sort_by_date(ws, last_row):
     """Сортирует журнал по дате, чтобы новые факты встали на своё место."""
     if last_row <= FIRST_DATA_ROW:
@@ -312,21 +337,29 @@ def sort_by_date(ws, last_row):
 
 def add_row(kind, amount, category, comment, user, when, account):
     """
-    Дописывает операцию в журнал бюджета со статусом «Факт».
-    Строка сначала копируется с образца — так приезжают формулы «авто»-колонок,
-    форматирование и выпадающие списки, — а потом заполняются только те ячейки,
-    где в образце стояло обычное значение, а не формула.
+    Записывает операцию в журнал бюджета со статусом «Факт».
+
+    Сначала ищем первую заранее оформленную пустую строку — в ней уже есть
+    формулы «авто»-колонок и выпадающие списки. Если запас кончился, копируем
+    последнюю нормальную строку, чтобы формулы и форматы приехали с ней.
+    Заполняем только те ячейки, где стоит обычное значение, а не формула.
     """
     ws = get_worksheet()
     values = ws.get_all_values()
-    new_row = max(len(values), HEADER_ROW) + 1
+    new_row, ready = find_target_row(values)
 
     if ws.row_count < new_row:
         ws.add_rows(new_row - ws.row_count + 50)
 
-    template = find_template_row(values)
+    template = None if ready else find_template_row(values)
     formulas = [""] * BUDGET_COLS
-    if template:
+
+    if ready:
+        # строка уже подготовлена — забираем из неё формулы «авто»-колонок
+        got = ws.get(f"A{new_row}:M{new_row}", value_render_option="FORMULA")
+        if got:
+            formulas = (list(got[0]) + [""] * BUDGET_COLS)[:BUDGET_COLS]
+    elif template:
         ws.spreadsheet.batch_update({"requests": [{"copyPaste": {
             "source": {
                 "sheetId": ws.id,
