@@ -19,6 +19,7 @@ from zoneinfo import ZoneInfo
 import gspread
 import telebot
 from telebot import types
+from gspread.utils import rowcol_to_a1
 from google.oauth2.service_account import Credentials
 from dotenv import load_dotenv
 
@@ -137,8 +138,30 @@ ALIASES = {
     "накопления": "Накопительный счёт", "копилка": "Накопительный счёт",
 }
 
-HEADERS = ["Дата", "Время", "Пользователь", "Тип", "Сумма",
-           "Категория", "Комментарий", "user_id", "Счёт"]
+# --- структура листа «Операции» в бюджетной таблице ---
+# A Дата · B Категория · C Тип · D Группа · E Статус · F Счёт · G Сумма
+# H Комментарий · I Месяц · J День нед. · K Год · L Месяц (выбор) · M День (выбор)
+# Часть колонок — формулы. Бот их не заполняет: он копирует строку-образец,
+# и формулы приходят вместе с ней, пересчитавшись на новую строку.
+BUDGET_COLS = 13
+HEADER_ROW = int(env("HEADER_ROW", "2"))      # строка с заголовками
+FIRST_DATA_ROW = HEADER_ROW + 1
+
+COL_DATE, COL_CATEGORY, COL_TYPE, COL_GROUP = 1, 2, 3, 4
+COL_STATUS, COL_ACCOUNT, COL_AMOUNT, COL_COMMENT = 5, 6, 7, 8
+COL_MONTH, COL_WEEKDAY, COL_YEAR, COL_MONTH_PICK, COL_DAY_PICK = 9, 10, 11, 12, 13
+
+STATUS_FACT, STATUS_PLAN = "Факт", "План"
+
+# сортировать журнал по дате после каждой записи, чтобы новые факты
+# вставали между плановыми строками, а не копились внизу
+SORT_AFTER_ADD = env("SORT_AFTER_ADD", "да").lower() not in ("нет", "no", "false", "0")
+
+# скрытый лист в той же таблице: кто и когда что внёс через бота.
+# В самом журнале операций автора нет, а для «Мои итоги» и /undo он нужен.
+LOG_SHEET = env("LOG_SHEET", "Журнал бота")
+LOG_HEADERS = ["Дата", "Время", "Пользователь", "user_id",
+               "Тип", "Категория", "Счёт", "Сумма", "Комментарий"]
 
 MONTHS_RU = ["Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
              "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"]
@@ -160,6 +183,7 @@ bot = telebot.TeleBot(BOT_TOKEN)
 # ------------------------------------------------------------ google sheets
 
 _worksheet = None
+_log_sheet = None
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
@@ -185,85 +209,273 @@ def load_credentials():
 
 
 def get_worksheet():
-    """Открывает лист таблицы (и создаёт его с заголовками, если нужно)."""
+    """Лист «Операции» бюджетной таблицы. Он должен существовать — не создаём."""
     global _worksheet
-    if _worksheet is not None:
-        return _worksheet
+    if _worksheet is None:
+        spreadsheet = gspread.authorize(load_credentials()).open_by_key(SPREADSHEET_ID)
+        _worksheet = spreadsheet.worksheet(WORKSHEET_NAME)
+    return _worksheet
 
-    spreadsheet = gspread.authorize(load_credentials()).open_by_key(SPREADSHEET_ID)
 
+def get_log_sheet():
+    """
+    Скрытый лист с историей записей бота.
+    В самом журнале операций автора нет, а для «Мои итоги» и /undo он нужен.
+    """
+    global _log_sheet
+    if _log_sheet is not None:
+        return _log_sheet
+
+    spreadsheet = get_worksheet().spreadsheet
     try:
-        ws = spreadsheet.worksheet(WORKSHEET_NAME)
+        ws = spreadsheet.worksheet(LOG_SHEET)
     except gspread.WorksheetNotFound:
-        ws = spreadsheet.add_worksheet(
-            title=WORKSHEET_NAME, rows=1000, cols=len(HEADERS)
-        )
+        ws = spreadsheet.add_worksheet(title=LOG_SHEET, rows=1000,
+                                       cols=len(LOG_HEADERS))
+        ws.append_row(LOG_HEADERS, value_input_option="USER_ENTERED")
+        try:
+            spreadsheet.batch_update({"requests": [{"updateSheetProperties": {
+                "properties": {"sheetId": ws.id, "hidden": True},
+                "fields": "hidden",
+            }}]})
+        except Exception:  # noqa: BLE001
+            log.warning("не удалось скрыть лист «%s»", LOG_SHEET)
 
-    # лист от старой версии бота бывает шириной ровно в 8 колонок —
-    # тогда запись в I1 падает с «exceeds grid limits», сначала расширяем лист
-    if ws.col_count < len(HEADERS):
-        ws.add_cols(len(HEADERS) - ws.col_count)
-
-    first_row = ws.row_values(1)
-    if not first_row:
-        ws.append_row(HEADERS, value_input_option="USER_ENTERED")
-        ws.format("A1:I1", {"textFormat": {"bold": True}})
-    elif "Счёт" not in first_row:
-        # таблица осталась от старой версии бота — дописываем колонку
-        ws.update_cell(1, len(HEADERS), "Счёт")
-        ws.format("A1:I1", {"textFormat": {"bold": True}})
-
-    _worksheet = ws
+    _log_sheet = ws
     return ws
 
 
+def parse_sheet_date(text):
+    """'24.08.2026' или '2026-08-24' -> date, иначе None."""
+    text = str(text).strip()
+    match = re.match(r"^(\d{1,2})[.\-/](\d{1,2})[.\-/](\d{4})$", text)
+    if match:
+        day, month, year = (int(x) for x in match.groups())
+    else:
+        match = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})$", text)
+        if not match:
+            return None
+        year, month, day = (int(x) for x in match.groups())
+    try:
+        return dt.date(year, month, day)
+    except ValueError:
+        return None
+
+
+def parse_money(text):
+    """'5 501', '1 234,50', 450 -> число. Пусто или мусор -> None."""
+    if isinstance(text, (int, float)):
+        return float(text)
+    cleaned = re.sub(r"[^\d,.\-]", "", str(text)).replace(",", ".")
+    if not re.search(r"\d", cleaned):
+        return None
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
+
+def category_info(name):
+    """(тип, группа) по названию категории."""
+    for cat_name, kind, group in CATEGORIES:
+        if cat_name == name:
+            return kind, group
+    return "", ""
+
+
+def find_template_row(values):
+    """
+    Номер строки-образца: последняя нормальная строка журнала.
+    С неё копируются формулы, форматы и выпадающие списки.
+    """
+    for index in range(len(values) - 1, FIRST_DATA_ROW - 2, -1):
+        row = list(values[index]) + [""] * BUDGET_COLS
+        if (row[COL_CATEGORY - 1].strip()
+                and row[COL_STATUS - 1].strip() in (STATUS_FACT, STATUS_PLAN)):
+            return index + 1
+    return None
+
+
+def sort_by_date(ws, last_row):
+    """Сортирует журнал по дате, чтобы новые факты встали на своё место."""
+    if last_row <= FIRST_DATA_ROW:
+        return
+    ws.spreadsheet.batch_update({"requests": [{"sortRange": {
+        "range": {
+            "sheetId": ws.id,
+            "startRowIndex": FIRST_DATA_ROW - 1, "endRowIndex": last_row,
+            "startColumnIndex": 0, "endColumnIndex": BUDGET_COLS,
+        },
+        "sortSpecs": [{"dimensionIndex": 0, "sortOrder": "ASCENDING"}],
+    }}]})
+
+
 def add_row(kind, amount, category, comment, user, when, account):
-    """Дописывает операцию в таблицу."""
+    """
+    Дописывает операцию в журнал бюджета со статусом «Факт».
+    Строка сначала копируется с образца — так приезжают формулы «авто»-колонок,
+    форматирование и выпадающие списки, — а потом заполняются только те ячейки,
+    где в образце стояло обычное значение, а не формула.
+    """
+    ws = get_worksheet()
+    values = ws.get_all_values()
+    new_row = max(len(values), HEADER_ROW) + 1
+
+    if ws.row_count < new_row:
+        ws.add_rows(new_row - ws.row_count + 50)
+
+    template = find_template_row(values)
+    formulas = [""] * BUDGET_COLS
+    if template:
+        ws.spreadsheet.batch_update({"requests": [{"copyPaste": {
+            "source": {
+                "sheetId": ws.id,
+                "startRowIndex": template - 1, "endRowIndex": template,
+                "startColumnIndex": 0, "endColumnIndex": BUDGET_COLS,
+            },
+            "destination": {
+                "sheetId": ws.id,
+                "startRowIndex": new_row - 1, "endRowIndex": new_row,
+                "startColumnIndex": 0, "endColumnIndex": BUDGET_COLS,
+            },
+            "pasteType": "PASTE_NORMAL",
+        }}]})
+        got = ws.get(f"A{template}:M{template}", value_render_option="FORMULA")
+        if got:
+            formulas = (list(got[0]) + [""] * BUDGET_COLS)[:BUDGET_COLS]
+
+    kind_name, group = category_info(category)
+    computed = {
+        COL_DATE: when.strftime("%d.%m.%Y"),
+        COL_CATEGORY: category,
+        COL_TYPE: kind_name or kind,
+        COL_GROUP: group,
+        COL_STATUS: STATUS_FACT,
+        COL_ACCOUNT: account,
+        COL_AMOUNT: amount,
+        COL_COMMENT: comment,
+        COL_MONTH: f"{MONTHS_RU[when.month - 1]} {when.year}",
+        COL_WEEKDAY: WEEKDAYS_RU[when.weekday()],
+        COL_YEAR: when.year,
+        COL_MONTH_PICK: MONTHS_RU[when.month - 1],
+        COL_DAY_PICK: when.day,
+    }
+
+    updates = []
+    for col, value in computed.items():
+        if str(formulas[col - 1]).startswith("="):
+            continue  # в образце формула — она уже скопирована и посчитает сама
+        updates.append({"range": rowcol_to_a1(new_row, col), "values": [[value]]})
+    if updates:
+        ws.batch_update(updates, value_input_option="USER_ENTERED")
+
+    if SORT_AFTER_ADD:
+        sort_by_date(ws, new_row)
+
+    write_log(user, kind, amount, category, account, comment, when)
+
+
+def write_log(user, kind, amount, category, account, comment, when):
+    """История записей бота. Запись в бюджет из-за неё ломаться не должна."""
     now = dt.datetime.now(ZoneInfo(TIMEZONE))
-    get_worksheet().append_row(
-        [
-            when.strftime("%Y-%m-%d"),
-            now.strftime("%H:%M"),
-            user_name(user),
-            kind,
-            amount,
-            category,
-            comment,
-            str(user.id),
-            account,
-        ],
-        value_input_option="USER_ENTERED",
-    )
+    try:
+        get_log_sheet().append_row(
+            [
+                when.strftime("%d.%m.%Y"), now.strftime("%H:%M"),
+                user_name(user), str(user.id),
+                kind, category, account, amount, comment,
+            ],
+            value_input_option="USER_ENTERED",
+        )
+    except Exception:  # noqa: BLE001
+        log.exception("не удалось записать в «%s»", LOG_SHEET)
 
 
 def read_rows():
-    """Все записи из таблицы в виде списка словарей."""
+    """Строки журнала операций в виде словарей."""
     values = get_worksheet().get_all_values()
     rows = []
-    for row in values[1:]:
-        row = row + [""] * (len(HEADERS) - len(row))
-        try:
-            amount = float(re.sub(r"[\s ]", "", str(row[4])).replace(",", "."))
-        except ValueError:
+    for raw in values[FIRST_DATA_ROW - 1:]:
+        row = list(raw) + [""] * BUDGET_COLS
+        date = parse_sheet_date(row[COL_DATE - 1])
+        amount = parse_money(row[COL_AMOUNT - 1])
+        if date is None or amount is None:
             continue
         rows.append({
-            "date": row[0], "time": row[1], "user": row[2], "kind": row[3],
-            "amount": amount, "category": row[5], "comment": row[6],
-            "user_id": str(row[7]).strip(), "account": row[8],
+            "date": date,
+            "category": row[COL_CATEGORY - 1].strip(),
+            "kind": row[COL_TYPE - 1].strip(),
+            "status": row[COL_STATUS - 1].strip(),
+            "account": row[COL_ACCOUNT - 1].strip(),
+            "amount": amount,
+            "comment": row[COL_COMMENT - 1].strip(),
+        })
+    return rows
+
+
+def read_my_rows(user_id):
+    """Записи, сделанные этим человеком через бота."""
+    try:
+        values = get_log_sheet().get_all_values()
+    except Exception:  # noqa: BLE001
+        return []
+    rows = []
+    for raw in values[1:]:
+        row = list(raw) + [""] * len(LOG_HEADERS)
+        if row[3].strip() != str(user_id):
+            continue
+        date = parse_sheet_date(row[0])
+        amount = parse_money(row[7])
+        if date is None or amount is None:
+            continue
+        rows.append({
+            "date": date, "kind": row[4].strip(), "category": row[5].strip(),
+            "account": row[6].strip(), "amount": amount,
+            "comment": row[8].strip(), "status": STATUS_FACT,
         })
     return rows
 
 
 def delete_last_row_of(user_id):
-    """Удаляет последнюю запись этого пользователя. Возвращает описание или None."""
-    ws = get_worksheet()
-    values = ws.get_all_values()
-    for index in range(len(values) - 1, 0, -1):
-        row = values[index] + [""] * (len(HEADERS) - len(values[index]))
-        if str(row[7]).strip() == str(user_id):
-            ws.delete_rows(index + 1)  # в таблице строки нумеруются с 1
-            return f"{row[3]} {row[4]} {CURRENCY} — {row[5]} ({row[0]})"
-    return None
+    """
+    Убирает последнюю запись этого человека и возвращает текст для ответа.
+    Строку в «Операциях» ищем по значениям, а не по номеру: журнал сортируется,
+    и номера строк со временем разъезжаются.
+    """
+    log_ws = get_log_sheet()
+    log_values = log_ws.get_all_values()
+
+    for index in range(len(log_values) - 1, 0, -1):
+        entry = list(log_values[index]) + [""] * len(LOG_HEADERS)
+        if entry[3].strip() != str(user_id):
+            continue
+
+        date = parse_sheet_date(entry[0])
+        category = entry[5].strip()
+        account = entry[6].strip()
+        comment = entry[8].strip()
+        amount = parse_money(entry[7])
+
+        ws = get_worksheet()
+        values = ws.get_all_values()
+        for j in range(len(values) - 1, FIRST_DATA_ROW - 2, -1):
+            row = list(values[j]) + [""] * BUDGET_COLS
+            if (row[COL_STATUS - 1].strip() == STATUS_FACT
+                    and row[COL_CATEGORY - 1].strip() == category
+                    and row[COL_ACCOUNT - 1].strip() == account
+                    and row[COL_COMMENT - 1].strip() == comment
+                    and parse_money(row[COL_AMOUNT - 1]) == amount
+                    and parse_sheet_date(row[COL_DATE - 1]) == date):
+                ws.delete_rows(j + 1)
+                log_ws.delete_rows(index + 1)
+                return (f"Удалено: {money(amount)} — {category} "
+                        f"({date.strftime('%d.%m.%Y')})")
+
+        log_ws.delete_rows(index + 1)
+        return ("Эту запись в «Операциях» уже удалили или поправили вручную — "
+                "убрал её только из истории бота.")
+
+    return "У вас нет записей, сделанных через бота."
 
 
 # -------------------------------------------------------------- разбор ввода
@@ -413,31 +625,38 @@ def human_date(when):
 
 # ------------------------------------------------------------------ отчёты
 
-def month_report(rows, user_id=None):
-    today = dt.datetime.now(ZoneInfo(TIMEZONE))
-    prefix = today.strftime("%Y-%m")
-    selected = [r for r in rows if r["date"].startswith(prefix)]
-    if user_id is not None:
-        selected = [r for r in selected if r["user_id"] == str(user_id)]
-    if not selected:
-        return "За этот месяц записей пока нет."
+def month_report(rows, title="Итоги за"):
+    """Свод по месяцу. Считаются только строки со статусом «Факт»."""
+    today = dt.datetime.now(ZoneInfo(TIMEZONE)).date()
+    fact = [r for r in rows
+            if r["status"] == STATUS_FACT
+            and r["date"].year == today.year and r["date"].month == today.month]
+    plan = [r for r in rows
+            if r["status"] == STATUS_PLAN
+            and r["date"].year == today.year and r["date"].month == today.month]
 
-    income = sum(r["amount"] for r in selected if r["kind"] == INCOME)
-    expense = sum(r["amount"] for r in selected if r["kind"] == EXPENSE)
-    saving = sum(r["amount"] for r in selected if r["kind"] == SAVING)
+    if not fact:
+        return f"{title} {MONTHS_RU[today.month - 1]}: фактических записей пока нет."
+
+    income = sum(r["amount"] for r in fact if r["kind"] == INCOME)
+    expense = sum(r["amount"] for r in fact if r["kind"] == EXPENSE)
+    saving = sum(r["amount"] for r in fact if r["kind"] == SAVING)
 
     by_category = {}
-    for r in selected:
+    for r in fact:
         if r["kind"] == EXPENSE:
             by_category[r["category"]] = by_category.get(r["category"], 0) + r["amount"]
 
     lines = [
-        f"<b>Итоги за {MONTHS_RU[today.month - 1]} {today.year}</b>",
+        f"<b>{title} {MONTHS_RU[today.month - 1]} {today.year}</b>",
         f"Доходы: {money(income)}",
         f"Расходы: {money(expense)}",
         f"Отложено: {money(saving)}",
         f"Остаток: {money(income - expense - saving)}",
     ]
+    if plan:
+        planned = sum(r["amount"] for r in plan if r["kind"] == EXPENSE)
+        lines.append(f"\nВ планах на остаток месяца: {money(planned)}")
     if by_category:
         lines.append("\n<b>Расходы по категориям</b>")
         for category, total in sorted(by_category.items(), key=lambda x: -x[1]):
@@ -447,16 +666,18 @@ def month_report(rows, user_id=None):
 
 
 def last_entries(rows, count=10):
-    if not rows:
-        return "Записей пока нет."
+    """Последние фактические операции журнала."""
+    fact = [r for r in rows if r["status"] == STATUS_FACT]
+    if not fact:
+        return "Фактических записей пока нет."
     signs = {INCOME: "+", EXPENSE: "−", SAVING: "→"}
     lines = ["<b>Последние записи</b>"]
-    for r in rows[-count:][::-1]:
+    for r in fact[-count:][::-1]:
         sign = signs.get(r["kind"], "−")
         comment = f" — {escape(r['comment'])}" if r["comment"] else ""
         account = f" · {escape(r['account'])}" if r["account"] else ""
-        lines.append(f"{r['date']} {sign}{money(r['amount'])} · {escape(r['category'])}"
-                     f"{account}{comment} <i>({escape(r['user'])})</i>")
+        lines.append(f"{r['date'].strftime('%d.%m.%Y')} {sign}{money(r['amount'])} · "
+                     f"{escape(r['category'])}{account}{comment}")
     return "\n".join(lines)
 
 
@@ -752,11 +973,7 @@ def cmd_last(message):
 def cmd_undo(message):
     if not allowed(message):
         return
-    removed = delete_last_row_of(message.from_user.id)
-    bot.send_message(
-        message.chat.id,
-        f"Удалено: {removed}" if removed else "У вас нет записей для удаления.",
-    )
+    bot.send_message(message.chat.id, delete_last_row_of(message.from_user.id))
 
 
 @bot.message_handler(commands=["check"])
@@ -788,11 +1005,24 @@ def cmd_check(message):
     lines.append(f"ID таблицы: {SPREADSHEET_ID} ({len(SPREADSHEET_ID)} символов)")
     lines.append(f"Лист: {WORKSHEET_NAME}")
 
+    global _log_sheet
     _worksheet = None  # заставляем переподключиться
+    _log_sheet = None
     try:
         ws = get_worksheet()
-        lines.append(f"Таблица: открыта, лист «{ws.title}», строк с данными: "
-                     f"{max(ws.row_count and len(ws.col_values(1)) - 1, 0)}")
+        values = ws.get_all_values()
+        fact = sum(1 for r in read_rows() if r["status"] == STATUS_FACT)
+        template = find_template_row(values)
+        lines.append(f"Таблица: открыта, лист «{ws.title}», строк: {len(values)}, "
+                     f"из них фактических операций: {fact}")
+        lines.append(f"Строка-образец для новых записей: "
+                     f"{template if template else 'не найдена — журнал пуст'}")
+        can_write = "да"
+        try:
+            get_log_sheet()
+        except Exception as exc:  # noqa: BLE001
+            can_write = f"нет — {type(exc).__name__}: {exc}"
+        lines.append(f"Лист «{LOG_SHEET}» доступен: {can_write}")
     except Exception as exc:  # noqa: BLE001
         lines.append(f"Таблица: НЕ открывается — {type(exc).__name__}: {exc}")
         if "404" in str(exc) or "NotFound" in type(exc).__name__:
@@ -828,7 +1058,7 @@ def on_text(message):
     if text.startswith("👤"):
         bot.send_message(
             message.chat.id,
-            month_report(read_rows(), user_id=message.from_user.id),
+            month_report(read_my_rows(message.from_user.id), "Ваши записи за"),
             parse_mode="HTML",
         )
         return
