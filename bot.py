@@ -3,7 +3,7 @@
 Все записи складываются в Google-таблицу.
 
 Запуск:  python bot.py
-Настройки берутся из файла .env (см. .env.example)
+Настройки берутся из файла .env (см. .env.example) или из переменных окружения.
 """
 
 import os
@@ -11,15 +11,13 @@ import re
 import json
 import base64
 import logging
-import calendar as cal
+import calendar
 import datetime as dt
-from html import escape
 from zoneinfo import ZoneInfo
 
 import gspread
 import telebot
 from telebot import types
-from gspread.utils import rowcol_to_a1
 from google.oauth2.service_account import Credentials
 from dotenv import load_dotenv
 
@@ -27,141 +25,61 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-
-def env(name, default=""):
-    """
-    Значение переменной окружения без мусора по краям.
-    На хостингах в панель нередко попадают кавычки и пробелы — Telegram и Google
-    из-за одного лишнего символа отвечают «Unauthorized», поэтому чистим сразу.
-    """
-    value = os.getenv(name, default).strip()
-    while len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-        value = value[1:-1].strip()
-    return value
-
-
-BOT_TOKEN = env("BOT_TOKEN")
-SPREADSHEET_ID = env("SPREADSHEET_ID")
-CREDENTIALS_FILE = env("GOOGLE_CREDENTIALS_FILE", "credentials.json")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "").strip()
+CREDENTIALS_FILE = os.getenv("GOOGLE_CREDENTIALS_FILE", "credentials.json").strip()
 # на хостинге ключ удобнее держать не файлом, а переменной окружения:
 # сюда кладётся всё содержимое credentials.json (или оно же в base64)
-CREDENTIALS_JSON = env("GOOGLE_CREDENTIALS_JSON")
-WORKSHEET_NAME = env("WORKSHEET_NAME", "Операции")
-TIMEZONE = env("TIMEZONE", "Europe/Moscow")
-CURRENCY = env("CURRENCY", "₽")
-
-# токен иногда копируют вместе со словом bot или с адресом api.telegram.org
-BOT_TOKEN = re.sub(r"^(https?://)?(api\.telegram\.org/)?bot", "", BOT_TOKEN)
+CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON", "").strip()
+WORKSHEET_NAME = os.getenv("WORKSHEET_NAME", "Операции").strip()
+TIMEZONE = os.getenv("TIMEZONE", "Europe/Moscow").strip()
+CURRENCY = os.getenv("CURRENCY", "₽").strip()
 
 # кто может пользоваться ботом (id через запятую). Пусто = никто, бот подскажет id
-ALLOWED_USERS = {int(x) for x in re.findall(r"\d+", env("ALLOWED_USERS"))}
+ALLOWED_USERS = {int(x) for x in re.findall(r"\d+", os.getenv("ALLOWED_USERS", ""))}
 
-EXPENSE, INCOME, SAVING = "Расход", "Доход", "Накопления"
+EXPENSE, INCOME, SAVING = "Расход", "Доход", "Накопление"
+FACT, PLAN = "Факт", "План"
+ONCE, REGULAR = "Однократно", "Регулярно"
 
-# Категории — ровно как на листе «Справочники» бюджетной таблицы.
-# Формат: (название, тип, группа). Группа нужна только расходам.
-CATEGORIES = [
-    ("Продукты", EXPENSE, "Постоянные"),
-    ("Еда вне дома", EXPENSE, "Постоянные"),
-    ("Такси и транспорт", EXPENSE, "Постоянные"),
-    ("Связь", EXPENSE, "Постоянные"),
-    ("Подписки", EXPENSE, "Постоянные"),
-    ("Коммунальные платежи и аренда", EXPENSE, "Постоянные"),
-    ("Ипотека", EXPENSE, "Постоянные"),
-    ("Рассрочки и кредиты", EXPENSE, "Постоянные"),
-    ("Налоги, страховки", EXPENSE, "Постоянные"),
-    ("Логопед", EXPENSE, "Постоянные"),
-    ("Кружки и развлечения ребёнка", EXPENSE, "Постоянные"),
-    ("Подарки", EXPENSE, "Постоянные"),
-    ("Вредные привычки", EXPENSE, "Постоянные"),
-    ("Одежда и обувь ребёнка", EXPENSE, "Переменные"),
-    ("Одежда и обувь взрослых", EXPENSE, "Переменные"),
-    ("Здоровье ребёнка", EXPENSE, "Переменные"),
-    ("Здоровье взрослых", EXPENSE, "Переменные"),
-    ("Игрушки и книжки", EXPENSE, "Переменные"),
-    ("Бытовая химия и дом", EXPENSE, "Переменные"),
-    ("Техника и электроника", EXPENSE, "Переменные"),
-    ("Уходовая косметика", EXPENSE, "Переменные"),
-    ("Декоративная косметика", EXPENSE, "Переменные"),
-    ("Услуги по уходу", EXPENSE, "Переменные"),
-    ("Развлечения", EXPENSE, "Переменные"),
-    ("Аванс (Ира)", INCOME, ""),
-    ("Зарплата (Ира)", INCOME, ""),
-    ("Прочий доход", INCOME, ""),
-    ("Накопительный счёт", SAVING, "Подушка"),
-    ("ПДС", SAVING, "Инвестиции"),
-    ("ИИС", SAVING, "Инвестиции"),
-    ("БС", SAVING, "Инвестиции"),
-]
+KIND_BY_TAG = {"e": EXPENSE, "i": INCOME, "s": SAVING}
+TAG_BY_KIND = {v: k for k, v in KIND_BY_TAG.items()}
 
-CATEGORY_NAMES = [c[0] for c in CATEGORIES]
-EXPENSE_GROUPS = ["Постоянные", "Переменные"]
-
-# Счета — как в справочнике «Счёт / куда»
-ACCOUNTS = [
-    "Карта (Ира)", "Карта (Илья)", "Наличные",
-    "Накопительный счёт", "ИИС", "БС", "ПДС",
-]
-DEFAULT_ACCOUNT = env("DEFAULT_ACCOUNT", "Карта (Ира)")
-
-# у кого какой счёт по умолчанию: telegram id -> название счёта
-# в .env пишется как ACCOUNT_BY_USER=311328289:Карта (Ира),12345:Карта (Илья)
-ACCOUNT_BY_USER = {}
-for pair in env("ACCOUNT_BY_USER").split(","):
-    if ":" in pair:
-        uid, acc = pair.split(":", 1)
-        if uid.strip().isdigit():
-            ACCOUNT_BY_USER[int(uid.strip())] = acc.strip()
-
-# короткие слова, которые бот понимает как категорию при быстром вводе строкой
-ALIASES = {
-    "еда": "Продукты", "магазин": "Продукты", "супермаркет": "Продукты",
-    "кафе": "Еда вне дома", "ресторан": "Еда вне дома", "обед": "Еда вне дома",
-    "кофе": "Еда вне дома",
-    "такси": "Такси и транспорт", "метро": "Такси и транспорт",
-    "бензин": "Такси и транспорт", "транспорт": "Такси и транспорт",
-    "жкх": "Коммунальные платежи и аренда", "квартира": "Коммунальные платежи и аренда",
-    "аренда": "Коммунальные платежи и аренда", "коммуналка": "Коммунальные платежи и аренда",
-    "интернет": "Связь", "телефон": "Связь", "мобильный": "Связь",
-    "аптека": "Здоровье взрослых", "врач": "Здоровье взрослых",
-    "лекарства": "Здоровье взрослых",
-    "садик": "Кружки и развлечения ребёнка", "школа": "Кружки и развлечения ребёнка",
-    "кружок": "Кружки и развлечения ребёнка",
-    "игрушки": "Игрушки и книжки", "книжки": "Игрушки и книжки",
-    "химия": "Бытовая химия и дом", "дом": "Бытовая химия и дом",
-    "техника": "Техника и электроника", "электроника": "Техника и электроника",
-    "одежда": "Одежда и обувь взрослых", "обувь": "Одежда и обувь взрослых",
-    "косметика": "Уходовая косметика",
-    "кредит": "Рассрочки и кредиты", "рассрочка": "Рассрочки и кредиты",
-    "налоги": "Налоги, страховки", "страховка": "Налоги, страховки",
-    "зп": "Зарплата (Ира)", "зарплата": "Зарплата (Ира)", "аванс": "Аванс (Ира)",
-    "накопления": "Накопительный счёт", "копилка": "Накопительный счёт",
+CATEGORIES = {
+    EXPENSE: [
+        "Продукты", "Кафе", "Транспорт", "Дом и ЖКХ", "Дети",
+        "Здоровье", "Одежда", "Развлечения", "Подарки", "Путешествия",
+        "Образование", "Прочее",
+    ],
+    INCOME: [
+        "Зарплата", "Подработка", "Инвестиции", "Подарок", "Возврат", "Прочее",
+    ],
+    SAVING: [
+        "Подушка", "Отпуск", "Крупная покупка", "Образование детей",
+        "Пенсия", "Инвестиции", "Прочее",
+    ],
 }
 
-# --- структура листа «Операции» в бюджетной таблице ---
-# A Дата · B Категория · C Тип · D Группа · E Статус · F Счёт · G Сумма
-# H Комментарий · I Месяц · J День нед. · K Год · L Месяц (выбор) · M День (выбор)
-# Часть колонок — формулы. Бот их не заполняет: он занимает уже готовую строку
-# журнала (или копирует образец), и формулы считают сами.
-BUDGET_COLS = 13
-HEADER_ROW = int(env("HEADER_ROW", "2"))      # строка с заголовками
-FIRST_DATA_ROW = HEADER_ROW + 1
+# короткие слова, которые бот понимает как категорию
+ALIASES = {
+    "еда": "Продукты", "магазин": "Продукты", "супермаркет": "Продукты",
+    "такси": "Транспорт", "метро": "Транспорт", "бензин": "Транспорт",
+    "жкх": "Дом и ЖКХ", "квартира": "Дом и ЖКХ", "аренда": "Дом и ЖКХ",
+    "ресторан": "Кафе", "обед": "Кафе", "кофе": "Кафе",
+    "аптека": "Здоровье", "врач": "Здоровье", "лекарства": "Здоровье",
+    "садик": "Дети", "школа": "Дети", "игрушки": "Дети",
+    "зп": "Зарплата", "аванс": "Зарплата",
+    "дивиденды": "Инвестиции", "проценты": "Инвестиции", "вклад": "Инвестиции",
+}
 
-COL_DATE, COL_CATEGORY, COL_TYPE, COL_GROUP = 1, 2, 3, 4
-COL_STATUS, COL_ACCOUNT, COL_AMOUNT, COL_COMMENT = 5, 6, 7, 8
-COL_MONTH, COL_WEEKDAY, COL_YEAR, COL_MONTH_PICK, COL_DAY_PICK = 9, 10, 11, 12, 13
+HEADERS = ["Дата", "Время", "Пользователь", "Тип", "Статус", "Сумма",
+           "Категория", "Комментарий", "Повтор", "user_id"]
 
-STATUS_FACT, STATUS_PLAN = "Факт", "План"
+MONTHS = ["январь", "февраль", "март", "апрель", "май", "июнь", "июль",
+          "август", "сентябрь", "октябрь", "ноябрь", "декабрь"]
+WEEKDAYS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
 
-# скрытый лист в той же таблице: кто и когда что внёс через бота.
-# В самом журнале операций автора нет, а для «Мои итоги» и /undo он нужен.
-LOG_SHEET = env("LOG_SHEET", "Журнал бота")
-LOG_HEADERS = ["Дата", "Время", "Пользователь", "user_id",
-               "Тип", "Категория", "Счёт", "Сумма", "Комментарий"]
-
-MONTHS_RU = ["Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
-             "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"]
-WEEKDAYS_RU = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+MAX_DATES = 40  # предохранитель: больше дат за один раз не запишем
 
 logging.basicConfig(
     level=logging.INFO,
@@ -176,12 +94,17 @@ if not SPREADSHEET_ID:
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
+
+def today_date():
+    return dt.datetime.now(ZoneInfo(TIMEZONE)).date()
+
+
 # ------------------------------------------------------------ google sheets
 
-_worksheet = None
-_log_sheet = None
-
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+
+_worksheet = None
+_columns = {}
 
 
 def credentials_source():
@@ -204,295 +127,146 @@ def load_credentials():
     return Credentials.from_service_account_info(load_key_data(), scopes=SCOPES)
 
 
+def ensure_headers(ws):
+    """
+    Следит, чтобы в первой строке были все нужные заголовки.
+    Недостающие дописывает справа — старые данные при этом не сдвигаются.
+    Возвращает словарь «название столбца -> его номер».
+    """
+    header = ws.row_values(1)
+    if not header:
+        ws.append_row(HEADERS, value_input_option="USER_ENTERED")
+        ws.format("A1:J1", {"textFormat": {"bold": True}})
+        header = list(HEADERS)
+    else:
+        for name in HEADERS:
+            if name not in header:
+                header.append(name)
+                ws.update_cell(1, len(header), name)
+                log.info("В таблицу добавлен столбец «%s»", name)
+    return {name: index for index, name in enumerate(header)}
+
+
 def get_worksheet():
-    """Лист «Операции» бюджетной таблицы. Он должен существовать — не создаём."""
-    global _worksheet
-    if _worksheet is None:
-        spreadsheet = gspread.authorize(load_credentials()).open_by_key(SPREADSHEET_ID)
-        _worksheet = spreadsheet.worksheet(WORKSHEET_NAME)
-    return _worksheet
+    """Открывает лист таблицы (и создаёт его с заголовками, если нужно)."""
+    global _worksheet, _columns
+    if _worksheet is not None:
+        return _worksheet
 
+    spreadsheet = gspread.authorize(load_credentials()).open_by_key(SPREADSHEET_ID)
 
-def get_log_sheet():
-    """
-    Скрытый лист с историей записей бота.
-    В самом журнале операций автора нет, а для «Мои итоги» и /undo он нужен.
-    """
-    global _log_sheet
-    if _log_sheet is not None:
-        return _log_sheet
-
-    spreadsheet = get_worksheet().spreadsheet
     try:
-        ws = spreadsheet.worksheet(LOG_SHEET)
+        ws = spreadsheet.worksheet(WORKSHEET_NAME)
     except gspread.WorksheetNotFound:
-        ws = spreadsheet.add_worksheet(title=LOG_SHEET, rows=1000,
-                                       cols=len(LOG_HEADERS))
-        ws.append_row(LOG_HEADERS, value_input_option="USER_ENTERED")
-        try:
-            spreadsheet.batch_update({"requests": [{"updateSheetProperties": {
-                "properties": {"sheetId": ws.id, "hidden": True},
-                "fields": "hidden",
-            }}]})
-        except Exception:  # noqa: BLE001
-            log.warning("не удалось скрыть лист «%s»", LOG_SHEET)
+        ws = spreadsheet.add_worksheet(
+            title=WORKSHEET_NAME, rows=1000, cols=len(HEADERS)
+        )
 
-    _log_sheet = ws
+    _columns = ensure_headers(ws)
+    _worksheet = ws
     return ws
 
 
-def parse_sheet_date(text):
-    """'24.08.2026' или '2026-08-24' -> date, иначе None."""
-    text = str(text).strip()
-    match = re.match(r"^(\d{1,2})[.\-/](\d{1,2})[.\-/](\d{4})$", text)
-    if match:
-        day, month, year = (int(x) for x in match.groups())
-    else:
-        match = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})$", text)
-        if not match:
-            return None
-        year, month, day = (int(x) for x in match.groups())
-    try:
-        return dt.date(year, month, day)
-    except ValueError:
-        return None
-
-
-def parse_money(text):
-    """'5 501', '1 234,50', 450 -> число. Пусто или мусор -> None."""
-    if isinstance(text, (int, float)):
-        return float(text)
-    cleaned = re.sub(r"[^\d,.\-]", "", str(text)).replace(",", ".")
-    if not re.search(r"\d", cleaned):
-        return None
-    try:
-        return float(cleaned)
-    except ValueError:
-        return None
-
-
-def category_info(name):
-    """(тип, группа) по названию категории."""
-    for cat_name, kind, group in CATEGORIES:
-        if cat_name == name:
-            return kind, group
-    return "", ""
-
-
-def find_template_row(values):
+def add_rows(entries, user):
     """
-    Номер строки-образца: последняя нормальная строка журнала.
-    С неё копируются формулы, форматы и выпадающие списки.
-    """
-    for index in range(len(values) - 1, FIRST_DATA_ROW - 2, -1):
-        row = list(values[index]) + [""] * BUDGET_COLS
-        if (row[COL_CATEGORY - 1].strip()
-                and row[COL_STATUS - 1].strip() in (STATUS_FACT, STATUS_PLAN)):
-            return index + 1
-    return None
-
-
-def find_target_row(values):
-    """
-    Куда писать новую операцию.
-    Ниже данных в журнале лежат заранее оформленные пустые строки — со статусом
-    «План», счётом и выпадающими списками. Занимаем первую такую: в ней уже есть
-    и формулы, и форматирование. Если запаса нет — пишем следом за последней
-    заполненной строкой.
-    Возвращает (строка для записи, есть ли она уже в листе).
-    """
-    last_filled = HEADER_ROW
-    first_free = None
-    for index in range(FIRST_DATA_ROW - 1, len(values)):
-        row = list(values[index]) + [""] * BUDGET_COLS
-        busy = bool(row[COL_CATEGORY - 1].strip()) or parse_money(row[COL_AMOUNT - 1]) is not None
-        if busy:
-            last_filled = index + 1
-            first_free = None  # ниже ещё есть данные — эта пустая строка не в счёт
-        elif first_free is None:
-            first_free = index + 1
-
-    if first_free:
-        return first_free, True
-    return last_filled + 1, False
-
-
-def add_row(kind, amount, category, comment, user, when, account):
-    """
-    Записывает операцию в журнал бюджета со статусом «Факт».
-
-    Сначала ищем первую заранее оформленную пустую строку — в ней уже есть
-    формулы «авто»-колонок и выпадающие списки. Если запас кончился, копируем
-    последнюю нормальную строку, чтобы формулы и форматы приехали с ней.
-    Заполняем только те ячейки, где стоит обычное значение, а не формула.
+    Пишет операции в таблицу. entries — список словарей с ключами
+    kind, status, amount, category, comment, date, repeat.
     """
     ws = get_worksheet()
-    values = ws.get_all_values()
-    new_row, ready = find_target_row(values)
-
-    if ws.row_count < new_row:
-        ws.add_rows(new_row - ws.row_count + 50)
-
-    template = None if ready else find_template_row(values)
-    formulas = [""] * BUDGET_COLS
-
-    if ready:
-        # строка уже подготовлена — забираем из неё формулы «авто»-колонок
-        got = ws.get(f"A{new_row}:M{new_row}", value_render_option="FORMULA")
-        if got:
-            formulas = (list(got[0]) + [""] * BUDGET_COLS)[:BUDGET_COLS]
-    elif template:
-        ws.spreadsheet.batch_update({"requests": [{"copyPaste": {
-            "source": {
-                "sheetId": ws.id,
-                "startRowIndex": template - 1, "endRowIndex": template,
-                "startColumnIndex": 0, "endColumnIndex": BUDGET_COLS,
-            },
-            "destination": {
-                "sheetId": ws.id,
-                "startRowIndex": new_row - 1, "endRowIndex": new_row,
-                "startColumnIndex": 0, "endColumnIndex": BUDGET_COLS,
-            },
-            "pasteType": "PASTE_NORMAL",
-        }}]})
-        got = ws.get(f"A{template}:M{template}", value_render_option="FORMULA")
-        if got:
-            formulas = (list(got[0]) + [""] * BUDGET_COLS)[:BUDGET_COLS]
-
-    kind_name, group = category_info(category)
-    computed = {
-        COL_DATE: when.strftime("%d.%m.%Y"),
-        COL_CATEGORY: category,
-        COL_TYPE: kind_name or kind,
-        COL_GROUP: group,
-        COL_STATUS: STATUS_FACT,
-        COL_ACCOUNT: account,
-        COL_AMOUNT: amount,
-        COL_COMMENT: comment,
-        COL_MONTH: f"{MONTHS_RU[when.month - 1]} {when.year}",
-        COL_WEEKDAY: WEEKDAYS_RU[when.weekday()],
-        COL_YEAR: when.year,
-        COL_MONTH_PICK: MONTHS_RU[when.month - 1],
-        COL_DAY_PICK: when.day,
-    }
-
-    updates = []
-    for col, value in computed.items():
-        if str(formulas[col - 1]).startswith("="):
-            continue  # в образце формула — она уже скопирована и посчитает сама
-        updates.append({"range": rowcol_to_a1(new_row, col), "values": [[value]]})
-    if updates:
-        ws.batch_update(updates, value_input_option="USER_ENTERED")
-
-    write_log(user, kind, amount, category, account, comment, when)
-
-
-def write_log(user, kind, amount, category, account, comment, when):
-    """История записей бота. Запись в бюджет из-за неё ломаться не должна."""
     now = dt.datetime.now(ZoneInfo(TIMEZONE))
-    try:
-        get_log_sheet().append_row(
-            [
-                when.strftime("%d.%m.%Y"), now.strftime("%H:%M"),
-                user_name(user), str(user.id),
-                kind, category, account, amount, comment,
-            ],
-            value_input_option="USER_ENTERED",
-        )
-    except Exception:  # noqa: BLE001
-        log.exception("не удалось записать в «%s»", LOG_SHEET)
+    width = max(_columns.values()) + 1
+
+    rows = []
+    for entry in entries:
+        row = [""] * width
+        values = {
+            "Дата": entry["date"].strftime("%Y-%m-%d"),
+            "Время": now.strftime("%H:%M"),
+            "Пользователь": user_name(user),
+            "Тип": entry["kind"],
+            "Статус": entry["status"],
+            "Сумма": entry["amount"],
+            "Категория": entry["category"],
+            "Комментарий": entry.get("comment", ""),
+            "Повтор": entry.get("repeat", ""),
+            "user_id": str(user.id),
+        }
+        for name, value in values.items():
+            if name in _columns:
+                row[_columns[name]] = value
+        rows.append(row)
+
+    ws.append_rows(rows, value_input_option="USER_ENTERED")
 
 
 def read_rows():
-    """Строки журнала операций в виде словарей."""
-    values = get_worksheet().get_all_values()
+    """Все записи из таблицы в виде списка словарей."""
+    ws = get_worksheet()
+    values = ws.get_all_values()
+
+    def cell(row, name):
+        index = _columns.get(name)
+        if index is None or index >= len(row):
+            return ""
+        return row[index]
+
     rows = []
-    for raw in values[FIRST_DATA_ROW - 1:]:
-        row = list(raw) + [""] * BUDGET_COLS
-        date = parse_sheet_date(row[COL_DATE - 1])
-        amount = parse_money(row[COL_AMOUNT - 1])
-        if date is None or amount is None:
+    for row in values[1:]:
+        try:
+            amount = float(
+                re.sub(r"[\s ]", "", cell(row, "Сумма")).replace(",", ".")
+            )
+        except ValueError:
             continue
         rows.append({
-            "date": date,
-            "category": row[COL_CATEGORY - 1].strip(),
-            "kind": row[COL_TYPE - 1].strip(),
-            "status": row[COL_STATUS - 1].strip(),
-            "account": row[COL_ACCOUNT - 1].strip(),
+            "date": cell(row, "Дата"),
+            "user": cell(row, "Пользователь"),
+            "kind": cell(row, "Тип"),
+            "status": cell(row, "Статус") or FACT,
             "amount": amount,
-            "comment": row[COL_COMMENT - 1].strip(),
-        })
-    return rows
-
-
-def read_my_rows(user_id):
-    """Записи, сделанные этим человеком через бота."""
-    try:
-        values = get_log_sheet().get_all_values()
-    except Exception:  # noqa: BLE001
-        return []
-    rows = []
-    for raw in values[1:]:
-        row = list(raw) + [""] * len(LOG_HEADERS)
-        if row[3].strip() != str(user_id):
-            continue
-        date = parse_sheet_date(row[0])
-        amount = parse_money(row[7])
-        if date is None or amount is None:
-            continue
-        rows.append({
-            "date": date, "kind": row[4].strip(), "category": row[5].strip(),
-            "account": row[6].strip(), "amount": amount,
-            "comment": row[8].strip(), "status": STATUS_FACT,
+            "category": cell(row, "Категория"),
+            "comment": cell(row, "Комментарий"),
+            "repeat": cell(row, "Повтор"),
+            "user_id": str(cell(row, "user_id")).strip(),
         })
     return rows
 
 
 def delete_last_row_of(user_id):
-    """
-    Убирает последнюю запись этого человека и возвращает текст для ответа.
-    Строку в «Операциях» ищем по значениям, а не по номеру: строки могли
-    сдвинуться, если журнал правили вручную.
-    """
-    log_ws = get_log_sheet()
-    log_values = log_ws.get_all_values()
+    """Удаляет последнюю запись этого пользователя. Возвращает описание или None."""
+    ws = get_worksheet()
+    values = ws.get_all_values()
+    id_col = _columns.get("user_id", len(HEADERS) - 1)
 
-    for index in range(len(log_values) - 1, 0, -1):
-        entry = list(log_values[index]) + [""] * len(LOG_HEADERS)
-        if entry[3].strip() != str(user_id):
-            continue
-
-        date = parse_sheet_date(entry[0])
-        category = entry[5].strip()
-        account = entry[6].strip()
-        comment = entry[8].strip()
-        amount = parse_money(entry[7])
-
-        ws = get_worksheet()
-        values = ws.get_all_values()
-        for j in range(len(values) - 1, FIRST_DATA_ROW - 2, -1):
-            row = list(values[j]) + [""] * BUDGET_COLS
-            if (row[COL_STATUS - 1].strip() == STATUS_FACT
-                    and row[COL_CATEGORY - 1].strip() == category
-                    and row[COL_ACCOUNT - 1].strip() == account
-                    and row[COL_COMMENT - 1].strip() == comment
-                    and parse_money(row[COL_AMOUNT - 1]) == amount
-                    and parse_sheet_date(row[COL_DATE - 1]) == date):
-                ws.delete_rows(j + 1)
-                log_ws.delete_rows(index + 1)
-                return (f"Удалено: {money(amount)} — {category} "
-                        f"({date.strftime('%d.%m.%Y')})")
-
-        log_ws.delete_rows(index + 1)
-        return ("Эту запись в «Операциях» уже удалили или поправили вручную — "
-                "убрал её только из истории бота.")
-
-    return "У вас нет записей, сделанных через бота."
+    for index in range(len(values) - 1, 0, -1):
+        row = values[index]
+        if len(row) > id_col and str(row[id_col]).strip() == str(user_id):
+            def cell(name):
+                i = _columns.get(name)
+                return row[i] if i is not None and i < len(row) else ""
+            ws.delete_rows(index + 1)  # в таблице строки нумеруются с 1
+            return (f"{cell('Статус')} · {cell('Тип')} {cell('Сумма')} {CURRENCY} — "
+                    f"{cell('Категория')} ({cell('Дата')})")
+    return None
 
 
 # -------------------------------------------------------------- разбор ввода
 
 AMOUNT_RE = re.compile(r"^([+\-])?(\d+(?:[.,]\d+)?)\s*(к|k|тыс)?$", re.IGNORECASE)
+DATE_WORDS = {"сегодня": 0, "вчера": 1, "позавчера": 2}
+DATE_RE = re.compile(r"^(\d{1,2})[.\-/](\d{1,2})(?:[.\-/](\d{2,4}))?$")
+
+MODIFIERS = {
+    "план": ("status", PLAN),
+    "плановый": ("status", PLAN),
+    "факт": ("status", FACT),
+    "доход": ("kind", INCOME),
+    "расход": ("kind", EXPENSE),
+    "накопление": ("kind", SAVING),
+    "накоп": ("kind", SAVING),
+    "копилка": ("kind", SAVING),
+    "отложить": ("kind", SAVING),
+}
 
 
 def parse_amount(token):
@@ -501,7 +275,7 @@ def parse_amount(token):
     match = AMOUNT_RE.match(token)
     if not match:
         return None
-    sign, number, thousands = match.groups()
+    _sign, number, thousands = match.groups()
     value = float(number.replace(",", "."))
     if thousands:
         value *= 1000
@@ -512,35 +286,6 @@ def parse_amount(token):
 
 def normalize(text):
     return re.sub(r"[^a-zа-яё0-9]", "", text.lower())
-
-
-def match_category(word, kind):
-    """Ищет категорию нужного типа по началу слова. Не нашёл — None."""
-    key = normalize(word)
-    if not key:
-        return None
-    if key in ALIASES:
-        found = ALIASES[key]
-        if category_kind(found) == kind:
-            return found
-    for name, cat_kind, _ in CATEGORIES:
-        if cat_kind != kind:
-            continue
-        cat_key = normalize(name)
-        if cat_key.startswith(key) or key.startswith(cat_key):
-            return name
-    return None
-
-
-def category_kind(name):
-    for cat_name, kind, _ in CATEGORIES:
-        if cat_name == name:
-            return kind
-    return EXPENSE
-
-
-DATE_WORDS = {"сегодня": 0, "вчера": 1, "позавчера": 2}
-DATE_RE = re.compile(r"^(\d{1,2})[.\-/](\d{1,2})(?:[.\-/](\d{2,4}))?$")
 
 
 def parse_date(token, today):
@@ -567,8 +312,8 @@ def parse_date(token, today):
     except ValueError:
         return None
 
-    # год не указан, а дата получилась в будущем — значит, это прошлый год
-    if year is None and result > today + dt.timedelta(days=1):
+    # год не указан, а дата больше чем на полгода вперёд — значит, прошлый год
+    if year is None and result > today + dt.timedelta(days=180):
         try:
             result = dt.date(candidate_year - 1, month, day)
         except ValueError:
@@ -576,39 +321,89 @@ def parse_date(token, today):
     return result
 
 
-def parse_entry(text, today=None):
-    """
-    Быстрый ввод строкой: '450 продукты обед', '+70000 зарплата',
-    'вчера 450 продукты'. Возвращает (kind, amount, category|None, comment, date).
-    """
-    if today is None:
-        today = today_date()
+def match_category(word, kind):
+    """Ищет категорию из списка по началу слова; иначе возвращает слово как есть."""
+    key = normalize(word)
+    if not key:
+        return None
+    if key in ALIASES:
+        return ALIASES[key]
+    for category in CATEGORIES[kind]:
+        cat_key = normalize(category)
+        if cat_key.startswith(key) or key.startswith(cat_key):
+            return category
+    return word.strip().capitalize()
 
-    parts = text.strip().split()
-    if not parts:
+
+def _try_parse(parts, today, allow_date):
+    when = None
+    kind = None
+    status = None
+    index = 0
+
+    while index < len(parts):
+        # дату проверяем раньше суммы: «12.09» — это дата, а не 12 рублей 9 копеек.
+        # если после такой «даты» суммы не окажется, второй заход разберёт её как сумму
+        if allow_date and when is None:
+            maybe = parse_date(parts[index], today)
+            if maybe is not None:
+                when = maybe
+                index += 1
+                continue
+        if parse_amount(parts[index]) is not None:
+            break
+        modifier = MODIFIERS.get(normalize(parts[index]))
+        if modifier:
+            field, value = modifier
+            if field == "kind":
+                kind = value
+            else:
+                status = value
+            index += 1
+            continue
+        break
+
+    if index >= len(parts):
         return None
 
-    when = parse_date(parts[0], today)
-    if when is not None:
-        rest = parts[1:]
-        if rest and parse_amount(rest[0]) is not None:
-            parts = rest
-        else:
-            # первое слово похоже на дату, но суммы за ним нет —
-            # значит это была сумма вроде 12.08 (12 рублей 8 копеек)
-            when = None
-    if when is None:
-        when = today
-
-    amount = parse_amount(parts[0])
+    amount = parse_amount(parts[index])
     if amount is None:
         return None
 
-    kind = INCOME if parts[0].startswith("+") else EXPENSE
-    category = match_category(parts[1], kind) if len(parts) > 1 else None
-    comment = " ".join(parts[2:]) if len(parts) > 2 else ""
-    return kind, amount, category, comment, when
+    if kind is None:
+        kind = INCOME if parts[index].startswith("+") else EXPENSE
 
+    rest = parts[index + 1:]
+    category = match_category(rest[0], kind) if rest else None
+    comment = " ".join(rest[1:]) if len(rest) > 1 else ""
+
+    return {
+        "kind": kind,
+        "status": status or FACT,
+        "amount": amount,
+        "category": category,
+        "comment": comment,
+        "date": when or today,
+    }
+
+
+def parse_entry(text, today=None):
+    """
+    Разбирает быстрый ввод: '450 продукты', '+70000 зарплата',
+    'вчера 450 продукты', 'план 12.09 5000 отпуск', 'накопление 10000 подушка'.
+    Возвращает словарь операции либо None.
+    """
+    if today is None:
+        today = today_date()
+    parts = text.strip().split()
+    if not parts:
+        return None
+    # первый заход — с распознаванием даты, второй — без него
+    # (на случай суммы вида 12.08, которую можно принять за дату)
+    return _try_parse(parts, today, True) or _try_parse(parts, today, False)
+
+
+# ------------------------------------------------------ контекст в сообщении
 
 def money(value):
     text = f"{value:,.2f}".replace(",", " ").replace(".", ",")
@@ -622,303 +417,169 @@ def user_name(user):
     return name or (user.username or str(user.id))
 
 
-def today_date():
-    return dt.datetime.now(ZoneInfo(TIMEZONE)).date()
-
-
-def human_date(when):
-    today = today_date()
-    if when == today:
-        return f"{when.strftime('%d.%m.%Y')} · сегодня"
-    if when == today - dt.timedelta(days=1):
-        return f"{when.strftime('%d.%m.%Y')} · вчера"
-    return f"{when.strftime('%d.%m.%Y')} · {WEEKDAYS_RU[when.weekday()]}"
-
-
-# ------------------------------------------------------------------ отчёты
-
-def month_report(rows, title="Итоги за"):
-    """Свод по месяцу. Считаются только строки со статусом «Факт»."""
-    today = dt.datetime.now(ZoneInfo(TIMEZONE)).date()
-    fact = [r for r in rows
-            if r["status"] == STATUS_FACT
-            and r["date"].year == today.year and r["date"].month == today.month]
-    plan = [r for r in rows
-            if r["status"] == STATUS_PLAN
-            and r["date"].year == today.year and r["date"].month == today.month]
-
-    if not fact:
-        return f"{title} {MONTHS_RU[today.month - 1]}: фактических записей пока нет."
-
-    income = sum(r["amount"] for r in fact if r["kind"] == INCOME)
-    expense = sum(r["amount"] for r in fact if r["kind"] == EXPENSE)
-    saving = sum(r["amount"] for r in fact if r["kind"] == SAVING)
-
-    by_category = {}
-    for r in fact:
-        if r["kind"] == EXPENSE:
-            by_category[r["category"]] = by_category.get(r["category"], 0) + r["amount"]
-
-    lines = [
-        f"<b>{title} {MONTHS_RU[today.month - 1]} {today.year}</b>",
-        f"Доходы: {money(income)}",
-        f"Расходы: {money(expense)}",
-        f"Отложено: {money(saving)}",
-        f"Остаток: {money(income - expense - saving)}",
-    ]
-    if plan:
-        planned = sum(r["amount"] for r in plan if r["kind"] == EXPENSE)
-        lines.append(f"\nВ планах на остаток месяца: {money(planned)}")
-    if by_category:
-        lines.append("\n<b>Расходы по категориям</b>")
-        for category, total in sorted(by_category.items(), key=lambda x: -x[1]):
-            share = f" ({total / expense * 100:.0f}%)" if expense else ""
-            lines.append(f"• {escape(category)}: {money(total)}{share}")
+def render_context(status, kind, dates=None, amount=None, comment="", tail=""):
+    """
+    Собирает текст сообщения-мастера. Из этого же текста контекст потом
+    читается обратно — поэтому бот ничего не забывает даже после перезапуска.
+    """
+    lines = [f"📝 {status} · {kind}"]
+    if dates:
+        lines.append("Даты: " + ", ".join(d.strftime("%d.%m.%Y") for d in dates))
+    if amount is not None:
+        lines.append(f"Сумма: {amount:g}")
+    if comment:
+        lines.append(f"Комментарий: {comment}")
+    if tail:
+        lines.append("")
+        lines.append(tail)
     return "\n".join(lines)
 
 
-def last_entries(rows, count=10):
-    """Последние фактические операции журнала."""
-    fact = [r for r in rows if r["status"] == STATUS_FACT]
-    if not fact:
-        return "Фактических записей пока нет."
-    signs = {INCOME: "+", EXPENSE: "−", SAVING: "→"}
-    lines = ["<b>Последние записи</b>"]
-    for r in fact[-count:][::-1]:
-        sign = signs.get(r["kind"], "−")
-        comment = f" — {escape(r['comment'])}" if r["comment"] else ""
-        account = f" · {escape(r['account'])}" if r["account"] else ""
-        lines.append(f"{r['date'].strftime('%d.%m.%Y')} {sign}{money(r['amount'])} · "
-                     f"{escape(r['category'])}{account}{comment}")
-    return "\n".join(lines)
+def parse_context(text):
+    """Читает контекст обратно из текста сообщения-мастера."""
+    if not text or not text.startswith("📝"):
+        return None
 
+    head = text.split("\n", 1)[0]
+    status = PLAN if PLAN in head else FACT
+    kind = next((k for k in (SAVING, INCOME, EXPENSE) if k in head), None)
+    if kind is None:
+        return None
 
-# --------------------------------------------------------------- черновики
+    dates = []
+    match = re.search(r"^Даты:\s*(.+)$", text, re.MULTILINE)
+    if match:
+        for chunk in match.group(1).split(","):
+            try:
+                dates.append(dt.datetime.strptime(chunk.strip(), "%d.%m.%Y").date())
+            except ValueError:
+                continue
 
-# что пользователь сейчас заполняет: user_id -> черновик записи
-DRAFTS = {}
+    amount = None
+    match = re.search(r"^Сумма:\s*([\d.,]+)", text, re.MULTILINE)
+    if match:
+        amount = parse_amount(match.group(1))
 
-KIND_ICONS = {EXPENSE: "💸", INCOME: "💰", SAVING: "🏦"}
+    comment = ""
+    match = re.search(r"^Комментарий:\s*(.+)$", text, re.MULTILINE)
+    if match:
+        comment = match.group(1).strip()
 
-
-def new_draft(user, chat_id):
-    draft = {
-        "kind": None,
-        "amount": None,
-        "category": None,
-        "account": ACCOUNT_BY_USER.get(user.id, DEFAULT_ACCOUNT),
-        "date": today_date(),
-        "comment": "",
-        "chat_id": chat_id,
-        "message_id": None,
-        "awaiting": None,     # "amount" | "comment" | None
-    }
-    DRAFTS[user.id] = draft
-    return draft
-
-
-def draft_of(user_id):
-    return DRAFTS.get(user_id)
-
-
-def drop_draft(user_id):
-    DRAFTS.pop(user_id, None)
+    return {"status": status, "kind": kind, "dates": dates,
+            "amount": amount, "comment": comment}
 
 
 # --------------------------------------------------------------- клавиатуры
 
-def btn(text, data):
-    return types.InlineKeyboardButton(text, callback_data=data)
-
-
 def main_keyboard():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.row("➕ Новая запись")
+    kb.row("➕ Новая операция")
     kb.row("📊 Итоги за месяц", "👤 Мои итоги")
     kb.row("🧾 Последние записи", "↩️ Удалить последнюю")
     kb.row("❓ Как записывать")
     return kb
 
 
-def kind_keyboard():
+def kinds_keyboard():
     kb = types.InlineKeyboardMarkup(row_width=3)
-    kb.add(btn("💸 Расход", "kind|0"),
-           btn("💰 Доход", "kind|1"),
-           btn("🏦 Накопление", "kind|2"))
-    kb.add(btn("✖️ Отмена", "cancel"))
-    return kb
-
-
-def group_keyboard(back="kind"):
-    """Для расходов сначала спрашиваем группу — иначе 24 кнопки в одном экране."""
-    kb = types.InlineKeyboardMarkup(row_width=2)
-    for i, group in enumerate(EXPENSE_GROUPS):
-        count = sum(1 for _, k, g in CATEGORIES if k == EXPENSE and g == group)
-        kb.add(btn(f"{group} · {count}", f"group|{i}"))
-    kb.add(btn("‹ Назад", f"back|{back}"), btn("✖️ Отмена", "cancel"))
-    return kb
-
-
-def category_keyboard(kind, group=None, back="kind"):
-    kb = types.InlineKeyboardMarkup(row_width=2)
-    buttons = [
-        btn(name, f"cat|{i}")
-        for i, (name, cat_kind, cat_group) in enumerate(CATEGORIES)
-        if cat_kind == kind and (group is None or cat_group == group)
-    ]
-    kb.add(*buttons)
-    kb.add(btn("‹ Назад", f"back|{back}"), btn("✖️ Отмена", "cancel"))
-    return kb
-
-
-def account_keyboard(current):
-    kb = types.InlineKeyboardMarkup(row_width=2)
     kb.add(*[
-        btn(("● " if name == current else "") + name, f"acc|{i}")
-        for i, name in enumerate(ACCOUNTS)
+        types.InlineKeyboardButton(kind, callback_data=f"w|k|{TAG_BY_KIND[kind]}")
+        for kind in (EXPENSE, INCOME, SAVING)
     ])
-    kb.add(btn("‹ Назад к записи", "back|card"))
     return kb
 
 
-def date_keyboard(when):
-    kb = types.InlineKeyboardMarkup(row_width=3)
-    kb.add(btn("Сегодня", "day|0"), btn("Вчера", "day|1"), btn("Позавчера", "day|2"))
-    kb.add(btn(f"📅 Календарь · {MONTHS_RU[when.month - 1]}", f"cal|{when.year}|{when.month}"))
-    kb.add(btn("‹ Назад к записи", "back|card"))
-    return kb
-
-
-def calendar_keyboard(year, month, chosen):
-    kb = types.InlineKeyboardMarkup(row_width=7)
-    today = today_date()
-
-    prev_month = dt.date(year, month, 1) - dt.timedelta(days=1)
-    next_month = dt.date(year, month, cal.monthrange(year, month)[1]) + dt.timedelta(days=1)
-
-    kb.row(
-        btn("‹", f"cal|{prev_month.year}|{prev_month.month}"),
-        btn(f"{MONTHS_RU[month - 1]} {year}", "noop"),
-        btn("›", f"cal|{next_month.year}|{next_month.month}"),
+def status_keyboard(tag):
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        types.InlineKeyboardButton(FACT, callback_data=f"w|s|{tag}|F"),
+        types.InlineKeyboardButton(PLAN, callback_data=f"w|s|{tag}|P"),
     )
-    kb.row(*[btn(d, "noop") for d in WEEKDAYS_RU])
+    return kb
 
-    for week in cal.monthcalendar(year, month):
-        row = []
+
+def repeat_keyboard(tag):
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        types.InlineKeyboardButton(ONCE, callback_data=f"w|r|{tag}|1"),
+        types.InlineKeyboardButton(REGULAR, callback_data=f"w|r|{tag}|R"),
+    )
+    return kb
+
+
+def categories_keyboard(kind):
+    kb = types.InlineKeyboardMarkup(row_width=3)
+    kb.add(*[
+        types.InlineKeyboardButton(category, callback_data=f"cat|{index}")
+        for index, category in enumerate(CATEGORIES[kind])
+    ])
+    return kb
+
+
+def calendar_keyboard(year, month, selected):
+    """Календарь месяца: отмеченные даты помечены галочкой."""
+    kb = types.InlineKeyboardMarkup(row_width=7)
+    stamp = f"{year}{month:02d}"
+
+    previous = dt.date(year, month, 1) - dt.timedelta(days=1)
+    following = dt.date(year, month, 28) + dt.timedelta(days=7)
+    kb.row(
+        types.InlineKeyboardButton(
+            "‹", callback_data=f"c|m|{previous.year}{previous.month:02d}"),
+        types.InlineKeyboardButton(
+            f"{MONTHS[month - 1].capitalize()} {year}", callback_data="c|nop"),
+        types.InlineKeyboardButton(
+            "›", callback_data=f"c|m|{following.year}{following.month:02d}"),
+    )
+    kb.row(*[types.InlineKeyboardButton(day, callback_data="c|nop")
+             for day in WEEKDAYS])
+
+    for week in calendar.Calendar(firstweekday=0).monthdayscalendar(year, month):
+        buttons = []
         for day in week:
             if day == 0:
-                row.append(btn(" ", "noop"))
+                buttons.append(types.InlineKeyboardButton(" ", callback_data="c|nop"))
                 continue
-            date = dt.date(year, month, day)
-            label = str(day)
-            if date == chosen:
-                label = f"[{day}]"
-            elif date == today:
-                label = f"·{day}·"
-            row.append(btn(label, f"pick|{year}|{month}|{day}"))
-        kb.row(*row)
+            current = dt.date(year, month, day)
+            mark = "✅" if current in selected else str(day)
+            buttons.append(types.InlineKeyboardButton(
+                mark, callback_data=f"c|d|{stamp}{day:02d}"))
+        kb.row(*buttons)
 
-    kb.row(btn("‹ Назад", "back|date"))
+    kb.row(
+        types.InlineKeyboardButton("🔁 Ежемесячно", callback_data="c|q|m"),
+        types.InlineKeyboardButton("🔁 Еженедельно", callback_data="c|q|w"),
+    )
+    kb.row(
+        types.InlineKeyboardButton("Очистить", callback_data="c|x"),
+        types.InlineKeyboardButton("Готово ✓", callback_data="c|ok"),
+    )
     return kb
 
 
-def comment_keyboard():
-    kb = types.InlineKeyboardMarkup(row_width=1)
-    kb.add(btn("Без комментария", "nocomment"))
-    kb.add(btn("‹ Назад к записи", "back|card"))
-    return kb
+CALENDAR_HINT = ("Отметьте даты, когда операция повторяется, и нажмите «Готово».\n"
+                 "«Ежемесячно» повторит отмеченные числа до конца года, "
+                 "«Еженедельно» — восемь раз подряд.")
 
-
-def card_keyboard():
-    kb = types.InlineKeyboardMarkup(row_width=2)
-    kb.add(btn("✅ Сохранить", "save"))
-    kb.add(btn("💰 Сумма", "edit|amount"), btn("🏷 Категория", "edit|category"))
-    kb.add(btn("💳 Счёт", "edit|account"), btn("📅 Дата", "edit|date"))
-    kb.add(btn("💬 Комментарий", "edit|comment"), btn("✖️ Отмена", "cancel"))
-    return kb
-
-
-# ------------------------------------------------------------ экраны мастера
-
-def card_text(draft):
-    icon = KIND_ICONS.get(draft["kind"], "🧾")
-    lines = [
-        f"{icon} <b>Черновик записи</b>",
-        "",
-        f"Тип: <b>{draft['kind']}</b>",
-        f"Сумма: <b>{money(draft['amount'])}</b>",
-        f"Категория: <b>{escape(draft['category'])}</b>",
-        f"Счёт: {escape(draft['account'])}",
-        f"Дата: {human_date(draft['date'])}",
-        f"Комментарий: {escape(draft['comment']) if draft['comment'] else '—'}",
-    ]
-    return "\n".join(lines)
-
-
-def show(draft, text, keyboard):
-    """Перерисовывает сообщение мастера (или создаёт его в первый раз)."""
-    if draft["message_id"] is None:
-        sent = bot.send_message(draft["chat_id"], text, parse_mode="HTML",
-                                reply_markup=keyboard)
-        draft["message_id"] = sent.message_id
-        return
-    try:
-        bot.edit_message_text(text, draft["chat_id"], draft["message_id"],
-                              parse_mode="HTML", reply_markup=keyboard)
-    except telebot.apihelper.ApiTelegramException:
-        sent = bot.send_message(draft["chat_id"], text, parse_mode="HTML",
-                                reply_markup=keyboard)
-        draft["message_id"] = sent.message_id
-
-
-def show_kind(draft):
-    draft["awaiting"] = None
-    show(draft, "Что записываем?", kind_keyboard())
-
-
-def show_amount(draft):
-    draft["awaiting"] = "amount"
-    icon = KIND_ICONS.get(draft["kind"], "🧾")
-    hint = "Например: <code>450</code>, <code>1,5к</code>, <code>2350,40</code>"
-    show(draft, f"{icon} <b>{draft['kind']}</b>\n\nВведите сумму сообщением.\n{hint}",
-         types.InlineKeyboardMarkup().add(btn("‹ Назад", "back|kind"),
-                                          btn("✖️ Отмена", "cancel")))
-
-
-def show_category(draft):
-    draft["awaiting"] = None
-    # если запись уже собрана, «Назад» должно возвращать в карточку, а не в начало
-    back = "card" if draft["category"] else ("amount" if draft["amount"] else "kind")
-    if draft["kind"] == EXPENSE:
-        show(draft, f"Расход {money(draft['amount'])}. Какая группа?",
-             group_keyboard(back))
-    else:
-        title = "Откуда доход?" if draft["kind"] == INCOME else "Куда откладываем?"
-        show(draft, f"{money(draft['amount'])}. {title}",
-             category_keyboard(draft["kind"], back=back))
-
-
-def show_card(draft):
-    draft["awaiting"] = None
-    show(draft, card_text(draft), card_keyboard())
-
-
-# ---------------------------------------------------------------- справка
+ASK_AMOUNT = "Напишите сумму и категорию, например: <code>5000 продукты</code>"
 
 HELP_TEXT = (
     "<b>Как записывать</b>\n\n"
-    "Самый простой путь — кнопка <b>➕ Новая запись</b> или команда /add: "
-    "бот проведёт по шагам (тип → сумма → категория) и покажет карточку, "
-    "где можно поменять счёт, дату в календаре и комментарий.\n\n"
-    "<b>Быстрый ввод строкой</b> тоже работает:\n"
+    "Расход — просто сумма и категория:\n"
     "<code>450 продукты</code>\n"
     "<code>1200 кафе обед с Аней</code>\n"
-    "<code>+70000 зарплата</code>\n"
+    "<code>1,5к транспорт</code>\n\n"
+    "Доход — со знаком «+»:\n"
+    "<code>+70000 зарплата</code>\n\n"
+    "Накопление и план — словом в начале:\n"
+    "<code>накопление 10000 подушка</code>\n"
+    "<code>план 12.09 5000 отпуск</code>\n\n"
+    "Дата покупки — первым словом:\n"
     "<code>вчера 450 продукты</code>\n"
-    "<code>12.08 3200 одежда куртка</code>\n\n"
-    "После быстрого ввода бот всё равно покажет карточку — сохранение "
-    "в один тап, но счёт и дату видно до записи.\n\n"
-    "Команды: /add, /report, /last, /undo, /id, /check"
+    "<code>12.08 3200 одежда куртка Мише</code>\n\n"
+    "Кнопка «➕ Новая операция» открывает пошаговый ввод: "
+    "тип → статус → для плана повтор с календарём.\n\n"
+    "Команды: /start, /report, /last, /undo, /id, /check"
 )
 
 
@@ -938,6 +599,66 @@ def allowed(message_or_call):
     return False
 
 
+# ------------------------------------------------------------------ отчёты
+
+def month_report(rows, user_id=None):
+    today = today_date()
+    prefix = today.strftime("%Y-%m")
+    selected = [r for r in rows if r["date"].startswith(prefix)]
+    if user_id is not None:
+        selected = [r for r in selected if r["user_id"] == str(user_id)]
+    if not selected:
+        return "За этот месяц записей пока нет."
+
+    def total(status, kind):
+        return sum(r["amount"] for r in selected
+                   if r["status"] == status and r["kind"] == kind)
+
+    fact_in, fact_out = total(FACT, INCOME), total(FACT, EXPENSE)
+    fact_save = total(FACT, SAVING)
+    plan_in, plan_out = total(PLAN, INCOME), total(PLAN, EXPENSE)
+    plan_save = total(PLAN, SAVING)
+
+    lines = [f"<b>Итоги за {today.strftime('%m.%Y')}</b>", "", "<b>Факт</b>",
+             f"Доходы: {money(fact_in)}",
+             f"Расходы: {money(fact_out)}",
+             f"Накопления: {money(fact_save)}",
+             f"Остаток: {money(fact_in - fact_out - fact_save)}"]
+
+    if plan_in or plan_out or plan_save:
+        lines += ["", "<b>План</b>",
+                  f"Доходы: {money(plan_in)}",
+                  f"Расходы: {money(plan_out)}",
+                  f"Накопления: {money(plan_save)}",
+                  f"Расходы к исполнению: {money(max(plan_out - fact_out, 0))}"]
+
+    by_category = {}
+    for r in selected:
+        if r["status"] == FACT and r["kind"] == EXPENSE:
+            by_category[r["category"]] = by_category.get(r["category"], 0) + r["amount"]
+    if by_category:
+        lines.append("\n<b>Расходы по категориям (факт)</b>")
+        for category, amount in sorted(by_category.items(), key=lambda x: -x[1]):
+            share = f" ({amount / fact_out * 100:.0f}%)" if fact_out else ""
+            lines.append(f"• {category}: {money(amount)}{share}")
+
+    return "\n".join(lines)
+
+
+def last_entries(rows, count=10):
+    if not rows:
+        return "Записей пока нет."
+    lines = ["<b>Последние записи</b>"]
+    for r in rows[-count:][::-1]:
+        sign = "+" if r["kind"] == INCOME else "−"
+        mark = "🔹" if r["status"] == PLAN else ""
+        comment = f" — {r['comment']}" if r["comment"] else ""
+        lines.append(f"{mark}{r['date']} {sign}{money(r['amount'])} · {r['category']}"
+                     f"{comment} <i>({r['user']})</i>")
+    lines.append("\n🔹 — плановая операция")
+    return "\n".join(lines)
+
+
 # --------------------------------------------------------------- обработчики
 
 @bot.message_handler(commands=["id"])
@@ -952,19 +673,11 @@ def cmd_start(message):
         return
     bot.send_message(
         message.chat.id,
-        f"Привет, {escape(user_name(message.from_user))}! Я веду учёт денег "
+        f"Привет, {user_name(message.from_user)}! Я веду учёт денег "
         "и складываю всё в Google-таблицу.\n\n" + HELP_TEXT,
         parse_mode="HTML",
         reply_markup=main_keyboard(),
     )
-
-
-@bot.message_handler(commands=["add"])
-def cmd_add(message):
-    if not allowed(message):
-        return
-    draft = new_draft(message.from_user, message.chat.id)
-    show_kind(draft)
 
 
 @bot.message_handler(commands=["report"])
@@ -985,7 +698,19 @@ def cmd_last(message):
 def cmd_undo(message):
     if not allowed(message):
         return
-    bot.send_message(message.chat.id, delete_last_row_of(message.from_user.id))
+    removed = delete_last_row_of(message.from_user.id)
+    bot.send_message(
+        message.chat.id,
+        f"Удалено: {removed}" if removed else "У вас нет записей для удаления.",
+    )
+
+
+@bot.message_handler(commands=["new"])
+def cmd_new(message):
+    if not allowed(message):
+        return
+    bot.send_message(message.chat.id, "Что записываем?",
+                     reply_markup=kinds_keyboard())
 
 
 @bot.message_handler(commands=["check"])
@@ -996,11 +721,9 @@ def cmd_check(message):
 
     global _worksheet
     lines = []
-    service_account = "не определён"
 
     try:
         data = load_key_data()
-        service_account = data.get("client_email", "не определён")
         key = data.get("private_key", "")
         whole = (key.startswith("-----BEGIN PRIVATE KEY-----")
                  and key.rstrip().endswith("-----END PRIVATE KEY-----"))
@@ -1014,46 +737,76 @@ def cmd_check(message):
         lines.append(f"Ключ не прочитан ({credentials_source()}): "
                      f"{type(exc).__name__}: {exc}")
 
-    lines.append(f"ID таблицы: {SPREADSHEET_ID} ({len(SPREADSHEET_ID)} символов)")
-    lines.append(f"Лист: {WORKSHEET_NAME}")
-
-    global _log_sheet
     _worksheet = None  # заставляем переподключиться
-    _log_sheet = None
     try:
         ws = get_worksheet()
-        values = ws.get_all_values()
-        fact = sum(1 for r in read_rows() if r["status"] == STATUS_FACT)
-        template = find_template_row(values)
-        lines.append(f"Таблица: открыта, лист «{ws.title}», строк: {len(values)}, "
-                     f"из них фактических операций: {fact}")
-        lines.append(f"Строка-образец для новых записей: "
-                     f"{template if template else 'не найдена — журнал пуст'}")
-        can_write = "да"
-        try:
-            get_log_sheet()
-        except Exception as exc:  # noqa: BLE001
-            can_write = f"нет — {type(exc).__name__}: {exc}"
-        lines.append(f"Лист «{LOG_SHEET}» доступен: {can_write}")
+        lines.append(f"Таблица: открыта, лист «{ws.title}»")
+        lines.append("Столбцы: " + ", ".join(_columns))
     except Exception as exc:  # noqa: BLE001
         lines.append(f"Таблица: НЕ открывается — {type(exc).__name__}: {exc}")
-        if "404" in str(exc) or "NotFound" in type(exc).__name__:
-            lines.append(
-                "\n404 значит одно из двух: неверный ID таблицы "
-                "или у сервисного аккаунта нет к ней доступа.\n"
-                "Откройте таблицу → Настройки доступа → добавьте как Редактора:\n"
-                f"{service_account}"
-            )
 
     bot.send_message(message.chat.id, "\n".join(lines))
 
 
-def forget_message(message):
-    """Убирает из чата то, что пользователь ввёл текстом — чтобы остался мастер."""
+def safe_edit(text, chat_id, message_id, markup=None, parse_mode=None):
+    """Правит сообщение, не падая, если текст и кнопки не изменились."""
     try:
-        bot.delete_message(message.chat.id, message.message_id)
-    except telebot.apihelper.ApiTelegramException:
-        pass
+        bot.edit_message_text(text, chat_id, message_id,
+                              reply_markup=markup, parse_mode=parse_mode)
+    except telebot.apihelper.ApiTelegramException as exc:
+        if "not modified" not in str(exc):
+            raise
+
+
+def ask_amount(chat_id, status, kind, dates, tail=None):
+    """
+    Просит сумму и категорию. Весь контекст операции лежит в тексте этого
+    сообщения — пользователь отвечает на него, и бот читает контекст обратно.
+    """
+    bot.send_message(
+        chat_id,
+        render_context(status, kind, dates, tail=tail or ASK_AMOUNT),
+        parse_mode="HTML",
+        reply_markup=types.ForceReply(selective=False),
+    )
+
+
+def save_and_report(chat_id, context, user, edit_message_id=None):
+    """Пишет операцию (одну или несколько дат) и отвечает подтверждением."""
+    dates = context["dates"] or [today_date()]
+    repeat = ""
+    if context["status"] == PLAN:
+        repeat = REGULAR if len(dates) > 1 else ONCE
+
+    entries = [{
+        "kind": context["kind"],
+        "status": context["status"],
+        "amount": context["amount"],
+        "category": context["category"],
+        "comment": context.get("comment", ""),
+        "date": day,
+        "repeat": repeat,
+    } for day in dates]
+
+    add_rows(entries, user)
+
+    sign = "+" if context["kind"] == INCOME else "−"
+    text = (f"Записал: {context['status']} · {context['kind']}\n"
+            f"{sign}{money(context['amount'])} · {context['category']}")
+    if context.get("comment"):
+        text += f" — {context['comment']}"
+    if len(dates) == 1:
+        text += f"\nДата: {dates[0].strftime('%d.%m.%Y')}"
+    else:
+        text += (f"\nДат: {len(dates)} — "
+                 + ", ".join(d.strftime("%d.%m") for d in dates[:6])
+                 + (" …" if len(dates) > 6 else ""))
+        text += f"\nИтого по плану: {money(context['amount'] * len(dates))}"
+
+    if edit_message_id:
+        bot.edit_message_text(text, chat_id, edit_message_id)
+    else:
+        bot.send_message(chat_id, text)
 
 
 @bot.message_handler(content_types=["text"])
@@ -1064,13 +817,13 @@ def on_text(message):
     text = message.text.strip()
 
     if text.startswith("➕"):
-        return cmd_add(message)
+        return cmd_new(message)
     if text.startswith("📊"):
         return cmd_report(message)
     if text.startswith("👤"):
         bot.send_message(
             message.chat.id,
-            month_report(read_my_rows(message.from_user.id), "Ваши записи за"),
+            month_report(read_rows(), user_id=message.from_user.id),
             parse_mode="HTML",
         )
         return
@@ -1082,262 +835,198 @@ def on_text(message):
         bot.send_message(message.chat.id, HELP_TEXT, parse_mode="HTML")
         return
 
-    draft = draft_of(message.from_user.id)
+    # ответ на сообщение мастера — тип, статус и даты берём оттуда
+    wizard = None
+    if message.reply_to_message:
+        wizard = parse_context(message.reply_to_message.text or "")
 
-    # ждём сумму
-    if draft and draft["awaiting"] == "amount":
-        amount = parse_amount(text)
-        if amount is None:
-            bot.send_message(message.chat.id,
-                             "Это не похоже на сумму. Например: <code>450</code>",
-                             parse_mode="HTML")
-            return
-        forget_message(message)
-        draft["amount"] = amount
-        if draft["category"]:
-            show_card(draft)
-        else:
-            show_category(draft)
-        return
-
-    # ждём комментарий
-    if draft and draft["awaiting"] == "comment":
-        forget_message(message)
-        draft["comment"] = text[:200]
-        show_card(draft)
-        return
-
-    # быстрый ввод строкой
     parsed = parse_entry(text)
     if parsed is None:
+        hint = ("Не понял 🤔 Начните сообщение с суммы, например "
+                "<code>450 продукты</code>.")
+        bot.send_message(message.chat.id, hint, parse_mode="HTML")
+        return
+
+    if wizard:
+        parsed["kind"] = wizard["kind"]
+        parsed["status"] = wizard["status"]
+        dates = wizard["dates"] or [parsed["date"]]
+    else:
+        dates = [parsed["date"]]
+
+    context = {
+        "kind": parsed["kind"],
+        "status": parsed["status"],
+        "amount": parsed["amount"],
+        "category": parsed["category"],
+        "comment": parsed["comment"],
+        "dates": dates,
+    }
+
+    if context["category"] is None:
         bot.send_message(
             message.chat.id,
-            "Не понял 🤔 Нажмите <b>➕ Новая запись</b> или начните сообщение "
-            "с суммы: <code>450 продукты</code>.",
-            parse_mode="HTML",
+            render_context(context["status"], context["kind"], dates,
+                           context["amount"], context["comment"],
+                           "Выберите категорию:"),
+            reply_markup=categories_keyboard(context["kind"]),
         )
         return
 
-    kind, amount, category, comment, when = parsed
-    draft = new_draft(message.from_user, message.chat.id)
-    draft["kind"] = kind
-    draft["amount"] = amount
-    draft["category"] = category
-    draft["comment"] = comment
-    draft["date"] = when
-    if category:
-        show_card(draft)
-    else:
-        show_category(draft)
+    save_and_report(message.chat.id, context, message.from_user)
 
 
-# ------------------------------------------------------------ кнопки мастера
+# ----- шаги мастера
 
-def need_draft(call):
-    draft = draft_of(call.from_user.id)
-    if draft is None:
-        bot.answer_callback_query(call.id, "Черновик уже закрыт — начните заново")
-        try:
-            bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id,
-                                          reply_markup=None)
-        except telebot.apihelper.ApiTelegramException:
-            pass
-        return None
-    draft["chat_id"] = call.message.chat.id
-    draft["message_id"] = call.message.message_id
-    return draft
+@bot.callback_query_handler(func=lambda call: call.data.startswith("w|"))
+def on_wizard(call):
+    if not allowed(call):
+        return
 
+    parts = call.data.split("|")
+    step, tag = parts[1], parts[2]
+    kind = KIND_BY_TAG[tag]
 
-@bot.callback_query_handler(func=lambda c: c.data == "noop")
-def on_noop(call):
+    if step == "k":
+        bot.edit_message_text(f"{kind}. Это план или уже свершившийся факт?",
+                              call.message.chat.id, call.message.message_id,
+                              reply_markup=status_keyboard(tag))
+
+    elif step == "s":
+        status = PLAN if parts[3] == "P" else FACT
+        if status == FACT:
+            bot.edit_message_text(f"{FACT} · {kind}", call.message.chat.id,
+                                  call.message.message_id)
+            # дату не фиксируем: её можно указать первым словом в ответе
+            ask_amount(call.message.chat.id, FACT, kind, None,
+                       "Напишите сумму и категорию. Если операция не сегодняшняя — "
+                       "дату первым словом: <code>вчера 450 продукты</code>")
+        else:
+            bot.edit_message_text(f"{PLAN} · {kind}. Операция разовая или повторяется?",
+                                  call.message.chat.id, call.message.message_id,
+                                  reply_markup=repeat_keyboard(tag))
+
+    elif step == "r":
+        if parts[3] == "1":
+            bot.edit_message_text(f"{PLAN} · {kind} · {ONCE}", call.message.chat.id,
+                                  call.message.message_id)
+            ask_amount(call.message.chat.id, PLAN, kind, None,
+                       "Напишите сумму и категорию. Дату планируемой операции — "
+                       "первым словом: <code>12.09 5000 отпуск</code>")
+        else:
+            today = today_date()
+            safe_edit(render_context(PLAN, kind, [], tail=CALENDAR_HINT),
+                      call.message.chat.id, call.message.message_id,
+                      calendar_keyboard(today.year, today.month, set()))
+
     bot.answer_callback_query(call.id)
 
 
-@bot.callback_query_handler(func=lambda c: c.data == "cancel")
-def on_cancel(call):
-    if not allowed(call):
-        return
-    drop_draft(call.from_user.id)
-    bot.edit_message_text("Запись отменена.", call.message.chat.id,
-                          call.message.message_id)
-    bot.answer_callback_query(call.id)
+# ----- календарь
+
+def expand_monthly(selected):
+    result = set(selected)
+    for day in selected:
+        month, year = day.month, day.year
+        while month < 12:
+            month += 1
+            last = calendar.monthrange(year, month)[1]
+            result.add(dt.date(year, month, min(day.day, last)))
+    return result
 
 
-@bot.callback_query_handler(func=lambda c: c.data.startswith("kind|"))
-def on_kind(call):
-    if not allowed(call):
-        return
-    draft = need_draft(call)
-    if not draft:
-        return
-    draft["kind"] = [EXPENSE, INCOME, SAVING][int(call.data.split("|")[1])]
-    draft["category"] = None
-    show_amount(draft)
-    bot.answer_callback_query(call.id)
+def expand_weekly(selected):
+    result = set(selected)
+    for day in selected:
+        for step in range(1, 8):
+            result.add(day + dt.timedelta(days=7 * step))
+    return result
 
 
-@bot.callback_query_handler(func=lambda c: c.data.startswith("group|"))
-def on_group(call):
-    if not allowed(call):
-        return
-    draft = need_draft(call)
-    if not draft:
-        return
-    group = EXPENSE_GROUPS[int(call.data.split("|")[1])]
-    show(draft, f"Расход {money(draft['amount'])} · {group}. Категория:",
-         category_keyboard(EXPENSE, group, back="category"))
-    bot.answer_callback_query(call.id)
-
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith("cat|"))
-def on_category(call):
-    if not allowed(call):
-        return
-    draft = need_draft(call)
-    if not draft:
-        return
-    draft["category"] = CATEGORY_NAMES[int(call.data.split("|")[1])]
-    if draft["amount"] is None:
-        show_amount(draft)
-    else:
-        show_card(draft)
-    bot.answer_callback_query(call.id)
-
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith("acc|"))
-def on_account(call):
-    if not allowed(call):
-        return
-    draft = need_draft(call)
-    if not draft:
-        return
-    draft["account"] = ACCOUNTS[int(call.data.split("|")[1])]
-    show_card(draft)
-    bot.answer_callback_query(call.id, draft["account"])
-
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith("day|"))
-def on_day(call):
-    if not allowed(call):
-        return
-    draft = need_draft(call)
-    if not draft:
-        return
-    draft["date"] = today_date() - dt.timedelta(days=int(call.data.split("|")[1]))
-    show_card(draft)
-    bot.answer_callback_query(call.id)
-
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith("cal|"))
+@bot.callback_query_handler(func=lambda call: call.data.startswith("c|"))
 def on_calendar(call):
     if not allowed(call):
         return
-    draft = need_draft(call)
-    if not draft:
+
+    parts = call.data.split("|")
+    action = parts[1]
+
+    if action == "nop":
+        bot.answer_callback_query(call.id)
         return
-    _, year, month = call.data.split("|")
-    year, month = int(year), int(month)
-    show(draft, "Выберите дату операции:",
-         calendar_keyboard(year, month, draft["date"]))
-    bot.answer_callback_query(call.id)
+
+    context = parse_context(call.message.text or "")
+    if context is None:
+        bot.answer_callback_query(call.id, "Начните заново: «Новая операция»")
+        return
+
+    selected = set(context["dates"])
+    today = today_date()
+    shown = min(selected) if selected else today
+    year, month = shown.year, shown.month
+    note = None
+
+    if action == "d":
+        stamp = parts[2]
+        day = dt.date(int(stamp[:4]), int(stamp[4:6]), int(stamp[6:8]))
+        year, month = day.year, day.month
+        if day in selected:
+            selected.discard(day)
+        elif len(selected) >= MAX_DATES:
+            note = f"Больше {MAX_DATES} дат за раз — многовато"
+        else:
+            selected.add(day)
+
+    elif action == "m":
+        year, month = int(parts[2][:4]), int(parts[2][4:6])
+
+    elif action == "q":
+        if not selected:
+            note = "Сначала отметьте хотя бы одну дату"
+        else:
+            grown = expand_monthly(selected) if parts[2] == "m" else expand_weekly(selected)
+            if len(grown) > MAX_DATES:
+                note = f"Получилось больше {MAX_DATES} дат — не стал добавлять"
+            else:
+                selected = grown
+
+    elif action == "x":
+        selected = set()
+
+    elif action == "ok":
+        if not selected:
+            bot.answer_callback_query(call.id, "Не отмечено ни одной даты")
+            return
+        ordered = sorted(selected)
+        bot.edit_message_text(
+            f"{PLAN} · {context['kind']} · {REGULAR}, дат: {len(ordered)}",
+            call.message.chat.id, call.message.message_id)
+        ask_amount(call.message.chat.id, PLAN, context["kind"], ordered)
+        bot.answer_callback_query(call.id)
+        return
+
+    ordered = sorted(selected)
+    safe_edit(render_context(PLAN, context["kind"], ordered, tail=CALENDAR_HINT),
+              call.message.chat.id, call.message.message_id,
+              calendar_keyboard(year, month, selected))
+    bot.answer_callback_query(call.id, note or "")
 
 
-@bot.callback_query_handler(func=lambda c: c.data.startswith("pick|"))
-def on_pick(call):
+# ----- выбор категории
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("cat|"))
+def on_category(call):
     if not allowed(call):
         return
-    draft = need_draft(call)
-    if not draft:
-        return
-    _, year, month, day = call.data.split("|")
-    draft["date"] = dt.date(int(year), int(month), int(day))
-    show_card(draft)
-    bot.answer_callback_query(call.id, draft["date"].strftime("%d.%m.%Y"))
 
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith("edit|"))
-def on_edit(call):
-    if not allowed(call):
-        return
-    draft = need_draft(call)
-    if not draft:
-        return
-    field = call.data.split("|")[1]
-    if field == "amount":
-        show_amount(draft)
-    elif field == "category":
-        show_category(draft)
-    elif field == "account":
-        show(draft, "С какого счёта?", account_keyboard(draft["account"]))
-    elif field == "date":
-        show(draft, f"Дата операции: {human_date(draft['date'])}",
-             date_keyboard(draft["date"]))
-    elif field == "comment":
-        draft["awaiting"] = "comment"
-        show(draft, "Напишите комментарий сообщением — или оставьте пустым.",
-             comment_keyboard())
-    bot.answer_callback_query(call.id)
-
-
-@bot.callback_query_handler(func=lambda c: c.data == "nocomment")
-def on_nocomment(call):
-    if not allowed(call):
-        return
-    draft = need_draft(call)
-    if not draft:
-        return
-    draft["comment"] = ""
-    show_card(draft)
-    bot.answer_callback_query(call.id)
-
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith("back|"))
-def on_back(call):
-    if not allowed(call):
-        return
-    draft = need_draft(call)
-    if not draft:
-        return
-    where = call.data.split("|")[1]
-    if where == "kind":
-        show_kind(draft)
-    elif where == "amount":
-        show_amount(draft)
-    elif where == "category":
-        show_category(draft)
-    elif where == "date":
-        show(draft, f"Дата операции: {human_date(draft['date'])}",
-             date_keyboard(draft["date"]))
-    else:
-        show_card(draft)
-    bot.answer_callback_query(call.id)
-
-
-@bot.callback_query_handler(func=lambda c: c.data == "save")
-def on_save(call):
-    if not allowed(call):
-        return
-    draft = need_draft(call)
-    if not draft:
-        return
-    if not (draft["kind"] and draft["amount"] and draft["category"]):
-        bot.answer_callback_query(call.id, "Не хватает данных")
+    context = parse_context(call.message.text or "")
+    if context is None or context["amount"] is None:
+        bot.answer_callback_query(call.id, "Начните заново")
         return
 
-    add_row(draft["kind"], draft["amount"], draft["category"], draft["comment"],
-            call.from_user, draft["date"], draft["account"])
-
-    icon = KIND_ICONS.get(draft["kind"], "🧾")
-    lines = [
-        f"{icon} <b>Записано</b>",
-        f"{money(draft['amount'])} · {escape(draft['category'])}",
-        f"{escape(draft['account'])} · {human_date(draft['date'])}",
-    ]
-    if draft["comment"]:
-        lines.append(escape(draft["comment"]))
-    bot.edit_message_text("\n".join(lines), draft["chat_id"], draft["message_id"],
-                          parse_mode="HTML")
-    drop_draft(call.from_user.id)
+    context["category"] = CATEGORIES[context["kind"]][int(call.data.split("|")[1])]
+    save_and_report(call.message.chat.id, context, call.from_user,
+                    edit_message_id=call.message.message_id)
     bot.answer_callback_query(call.id, "Готово")
 
 
@@ -1349,9 +1038,8 @@ def error_guard(handler):
         except Exception as exc:  # noqa: BLE001
             log.exception("ошибка в обработчике")
             chat = getattr(getattr(message_or_call, "message", None), "chat", None)
-            chat = chat or getattr(message_or_call, "chat", None)
-            if chat is not None:
-                bot.send_message(chat.id, f"Что-то пошло не так: {exc}")
+            chat_id = chat.id if chat else message_or_call.chat.id
+            bot.send_message(chat_id, f"Что-то пошло не так: {exc}")
     return wrapper
 
 
@@ -1359,24 +1047,6 @@ for h in bot.message_handlers + bot.callback_query_handlers:
     h["function"] = error_guard(h["function"])
 
 
-def masked_token():
-    """Как токен выглядит изнутри контейнера — без раскрытия самого токена."""
-    head = BOT_TOKEN[:4] if len(BOT_TOKEN) > 8 else "?"
-    tail = BOT_TOKEN[-4:] if len(BOT_TOKEN) > 8 else "?"
-    return f"{len(BOT_TOKEN)} символов, {head}…{tail}"
-
-
 if __name__ == "__main__":
-    try:
-        me = bot.get_me()
-    except telebot.apihelper.ApiTelegramException as exc:
-        log.error("Telegram не принял токен: %s", exc)
-        log.error("Переменная BOT_TOKEN внутри контейнера: %s", masked_token())
-        log.error("Правильный токен — 46 символов вида 1234567890:AA... "
-                  "Проверьте, что в переменной нет кавычек и пробелов "
-                  "и что она не задана второй раз где-то ещё.")
-        raise SystemExit(1)
-
-    log.info("Бот @%s запущен. Токен: %s", me.username, masked_token())
-    log.info("Разрешённые пользователи: %s", ALLOWED_USERS or "никого")
+    log.info("Бот запущен. Разрешённые пользователи: %s", ALLOWED_USERS or "никого")
     bot.infinity_polling(skip_pending=True)
