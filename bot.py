@@ -135,15 +135,24 @@ def ensure_headers(ws):
     """
     header = ws.row_values(1)
     if not header:
+        if ws.col_count < len(HEADERS):
+            ws.add_cols(len(HEADERS) - ws.col_count)
         ws.append_row(HEADERS, value_input_option="USER_ENTERED")
-        ws.format("A1:J1", {"textFormat": {"bold": True}})
-        header = list(HEADERS)
-    else:
-        for name in HEADERS:
-            if name not in header:
-                header.append(name)
-                ws.update_cell(1, len(header), name)
-                log.info("В таблицу добавлен столбец «%s»", name)
+        ws.format(f"A1:{chr(64 + len(HEADERS))}1", {"textFormat": {"bold": True}})
+        return {name: index for index, name in enumerate(HEADERS)}
+
+    missing = [name for name in HEADERS if name not in header]
+    if missing:
+        # в таблице может быть физически меньше столбцов, чем нам нужно —
+        # сначала расширяем сетку, иначе Google ответит «exceeds grid limits»
+        needed = len(header) + len(missing)
+        if ws.col_count < needed:
+            ws.add_cols(needed - ws.col_count)
+        for name in missing:
+            header.append(name)
+            ws.update_cell(1, len(header), name)
+            log.info("В таблицу добавлен столбец «%s»", name)
+
     return {name: index for index, name in enumerate(header)}
 
 
