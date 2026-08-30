@@ -104,6 +104,7 @@ def today_date():
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 _worksheet = None
+_spreadsheet = None
 _columns = {}
 
 
@@ -158,11 +159,12 @@ def ensure_headers(ws):
 
 def get_worksheet():
     """Открывает лист таблицы (и создаёт его с заголовками, если нужно)."""
-    global _worksheet, _columns
+    global _worksheet, _spreadsheet, _columns
     if _worksheet is not None:
         return _worksheet
 
     spreadsheet = gspread.authorize(load_credentials()).open_by_key(SPREADSHEET_ID)
+    _spreadsheet = spreadsheet
 
     try:
         ws = spreadsheet.worksheet(WORKSHEET_NAME)
@@ -205,7 +207,10 @@ def add_rows(entries, user):
                 row[_columns[name]] = value
         rows.append(row)
 
-    ws.append_rows(rows, value_input_option="USER_ENTERED")
+    response = ws.append_rows(rows, value_input_option="USER_ENTERED")
+    written = (response or {}).get("updates", {}).get("updatedRange", "")
+    log.info("Записано строк: %s -> %s", len(rows), written or "?")
+    return written
 
 
 def read_rows():
@@ -344,7 +349,7 @@ def match_category(word, kind):
     return word.strip().capitalize()
 
 
-def _try_parse(parts, today, allow_date):
+def _try_parse(parts, today, allow_date, kind_hint=None):
     when = None
     kind = None
     status = None
@@ -380,7 +385,8 @@ def _try_parse(parts, today, allow_date):
         return None
 
     if kind is None:
-        kind = INCOME if parts[index].startswith("+") else EXPENSE
+        # тип, выбранный кнопками, важнее знака «+» в тексте
+        kind = kind_hint or (INCOME if parts[index].startswith("+") else EXPENSE)
 
     rest = parts[index + 1:]
     category = match_category(rest[0], kind) if rest else None
@@ -396,10 +402,11 @@ def _try_parse(parts, today, allow_date):
     }
 
 
-def parse_entry(text, today=None):
+def parse_entry(text, today=None, kind_hint=None):
     """
     Разбирает быстрый ввод: '450 продукты', '+70000 зарплата',
     'вчера 450 продукты', 'план 12.09 5000 отпуск', 'накопление 10000 подушка'.
+    kind_hint — тип, уже выбранный кнопками: от него зависит список категорий.
     Возвращает словарь операции либо None.
     """
     if today is None:
@@ -409,7 +416,8 @@ def parse_entry(text, today=None):
         return None
     # первый заход — с распознаванием даты, второй — без него
     # (на случай суммы вида 12.08, которую можно принять за дату)
-    return _try_parse(parts, today, True) or _try_parse(parts, today, False)
+    return (_try_parse(parts, today, True, kind_hint)
+            or _try_parse(parts, today, False, kind_hint))
 
 
 # ------------------------------------------------------ контекст в сообщении
@@ -749,7 +757,10 @@ def cmd_check(message):
     _worksheet = None  # заставляем переподключиться
     try:
         ws = get_worksheet()
-        lines.append(f"Таблица: открыта, лист «{ws.title}»")
+        lines.append(f"Таблица: «{_spreadsheet.title}»")
+        lines.append(f"ID: {SPREADSHEET_ID}")
+        lines.append(f"Лист: «{ws.title}», строк с данными: "
+                     f"{max(len(ws.col_values(1)) - 1, 0)}")
         lines.append("Столбцы: " + ", ".join(_columns))
     except Exception as exc:  # noqa: BLE001
         lines.append(f"Таблица: НЕ открывается — {type(exc).__name__}: {exc}")
@@ -767,6 +778,13 @@ def safe_edit(text, chat_id, message_id, markup=None, parse_mode=None):
             raise
 
 
+# подстраховка: последний заданный вопрос мастера по каждому чату.
+# основной способ — контекст в тексте сообщения, но если ответить не «ответом»,
+# а обычным сообщением, бот всё равно вспомнит, о чём спрашивал
+LAST_PROMPT = {}
+PROMPT_TTL = dt.timedelta(minutes=30)
+
+
 def ask_amount(chat_id, status, kind, dates, tail=None):
     """
     Просит сумму и категорию. Весь контекст операции лежит в тексте этого
@@ -778,6 +796,22 @@ def ask_amount(chat_id, status, kind, dates, tail=None):
         parse_mode="HTML",
         reply_markup=types.ForceReply(selective=False),
     )
+    LAST_PROMPT[chat_id] = (
+        {"status": status, "kind": kind, "dates": list(dates or [])},
+        dt.datetime.now(),
+    )
+
+
+def recent_prompt(chat_id):
+    """Контекст последнего вопроса мастера, если он ещё не протух."""
+    saved = LAST_PROMPT.get(chat_id)
+    if not saved:
+        return None
+    context, moment = saved
+    if dt.datetime.now() - moment > PROMPT_TTL:
+        LAST_PROMPT.pop(chat_id, None)
+        return None
+    return context
 
 
 def save_and_report(chat_id, context, user, edit_message_id=None):
@@ -797,7 +831,7 @@ def save_and_report(chat_id, context, user, edit_message_id=None):
         "repeat": repeat,
     } for day in dates]
 
-    add_rows(entries, user)
+    written = add_rows(entries, user)
 
     sign = "+" if context["kind"] == INCOME else "−"
     text = (f"Записал: {context['status']} · {context['kind']}\n"
@@ -811,6 +845,8 @@ def save_and_report(chat_id, context, user, edit_message_id=None):
                  + ", ".join(d.strftime("%d.%m") for d in dates[:6])
                  + (" …" if len(dates) > 6 else ""))
         text += f"\nИтого по плану: {money(context['amount'] * len(dates))}"
+    if written:
+        text += f"\nВ таблице: {written}"
 
     if edit_message_id:
         bot.edit_message_text(text, chat_id, edit_message_id)
@@ -848,8 +884,10 @@ def on_text(message):
     wizard = None
     if message.reply_to_message:
         wizard = parse_context(message.reply_to_message.text or "")
+    if wizard is None:
+        wizard = recent_prompt(message.chat.id)
 
-    parsed = parse_entry(text)
+    parsed = parse_entry(text, kind_hint=wizard["kind"] if wizard else None)
     if parsed is None:
         hint = ("Не понял 🤔 Начните сообщение с суммы, например "
                 "<code>450 продукты</code>.")
@@ -860,6 +898,7 @@ def on_text(message):
         parsed["kind"] = wizard["kind"]
         parsed["status"] = wizard["status"]
         dates = wizard["dates"] or [parsed["date"]]
+        LAST_PROMPT.pop(message.chat.id, None)  # вопрос отработан
     else:
         dates = [parsed["date"]]
 
